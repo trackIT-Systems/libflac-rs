@@ -6,6 +6,25 @@ bit-exact with, the patch counts our own changes against it.
 
 ## Unreleased
 
+### Added
+
+- `StreamDecoder`: decodes native FLAC, raw frames or Ogg FLAC from any
+  `std::io::Read`, one `DecodedBlock` (a frame, or gap silence) at a time, so
+  memory stays bounded for long streams and untrusted input. Chained Ogg links
+  via `next_link`; the header (`StreamHeader`), gaps and MD5 result are available
+  as it goes. Frames over 16 MiB (the STREAMINFO limit) are rejected.
+- `decode_with` with `DecodeOptions { max_samples }`: decode into memory, but fail
+  with `DecodeError::LimitExceeded` before the output passes the limit. A small
+  file can otherwise legitimately expand to gigabytes (measured: 36 bytes per
+  2 MiB of silence, 72 bytes to 84 MB through a filled gap).
+
+### Changed
+
+- Decoding stops at STREAMINFO's sample count when it is set: data after the
+  declared end is no longer read (before, it was decoded and then discarded, and
+  trailing garbage made decoding fail).
+- The whole-buffer decode functions run on `StreamDecoder`.
+
 ### Fixed
 
 - The decoder no longer panics on malformed input. It now rejects what libFLAC

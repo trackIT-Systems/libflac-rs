@@ -7,9 +7,9 @@
 //! Encode ([`OggStream`]): packets are buffered and emitted as pages by
 //! `flush`/`pageout` exactly as `ogg_stream_flush`/`ogg_stream_pageout` do —
 //! including the "nominal page ≈ 4096 bytes and ≥ 4 packets, else 255 segments"
-//! rule. Decode ([`read_flac_streams`]): pages are CRC-checked and reassembled
-//! into packets by lacing values (a `< 255` segment ends a packet; `255` continues
-//! it, across pages), per FLAC logical stream.
+//! rule. Decode ([`parse_page`]): pages are parsed and CRC-checked one at a time;
+//! the stream decoder reassembles packets by lacing values (a `< 255` segment ends
+//! a packet; `255` continues it, across pages), per FLAC logical stream.
 
 /// The Ogg CRC-32 lookup table: polynomial `0x04c11db7`, **unreflected**, init/final
 /// `0` (`framing.c` `crc_lookup[0]`).
@@ -235,87 +235,59 @@ impl OggStream {
     }
 }
 
-/// The packets of the FLAC logical streams in `data`, one list per stream, in the
-/// order their BOS pages appear (`framing.c` decode side plus the stream selection
-/// of libFLAC's `ogg_decoder_aspect.c`). A logical stream is FLAC when its first
-/// packet carries the `0x7F"FLAC"` mapping header; pages of other streams are
-/// skipped. A stream ends at its EOS page, after which its serial number may start
-/// a new stream (a chain link). Reading stops once `max_streams` streams have
-/// ended, so later pages are not examined. Packets are reassembled across
-/// segments/pages by lacing values (a `< 255` segment ends a packet). `None` on a
-/// missing `OggS` sync, a truncated page, or a page CRC mismatch.
-pub fn read_flac_streams(data: &[u8], max_streams: usize) -> Option<Vec<Vec<Vec<u8>>>> {
-    struct Active {
-        serial: u32,
-        stream: usize,
-        partial: Vec<u8>,
+/// One Ogg page, borrowed from the input.
+pub struct Page<'a> {
+    /// Header-type flags: 0x01 continued packet, 0x02 BOS, 0x04 EOS.
+    pub flags: u8,
+    pub serial: u32,
+    /// Lacing values: a value `< 255` ends a packet, `255` continues it.
+    pub lacing: &'a [u8],
+    pub body: &'a [u8],
+}
+
+/// The result of [`parse_page`].
+pub enum PageParse<'a> {
+    /// A complete page and its length in bytes.
+    Page(Page<'a>, usize),
+    /// At least this many bytes are needed to parse the page.
+    NeedMore(usize),
+}
+
+/// Parse the page at the start of `data` (`framing.c` decode side), checking its
+/// CRC. `None` on a missing `OggS` capture pattern or a CRC mismatch. Pages are at
+/// most 65 307 bytes, so callers can buffer incrementally.
+pub fn parse_page(data: &[u8]) -> Option<PageParse<'_>> {
+    if data.len() < 27 {
+        return Some(PageParse::NeedMore(27));
     }
-    let mut streams: Vec<Vec<Vec<u8>>> = Vec::new();
-    let mut active: Vec<Active> = Vec::new();
-    let mut ended = 0usize;
-    let mut pos = 0usize;
-    while pos < data.len() && ended < max_streams {
-        if pos + 27 > data.len() || &data[pos..pos + 4] != b"OggS" {
-            return None;
-        }
-        let flags = data[pos + 5];
-        let serial = u32::from_le_bytes(data[pos + 14..pos + 18].try_into().ok()?);
-        let nsegs = data[pos + 26] as usize;
-        let seg_table = pos + 27;
-        let body_start = seg_table + nsegs;
-        if body_start > data.len() {
-            return None;
-        }
-        let body_len: usize = data[seg_table..body_start]
-            .iter()
-            .map(|&b| b as usize)
-            .sum();
-        let body_end = body_start + body_len;
-        if body_end > data.len() {
-            return None;
-        }
-
-        // Verify the page CRC over the header (CRC field zeroed) + body.
-        let stored = u32::from_le_bytes(data[pos + 22..pos + 26].try_into().ok()?);
-        let mut header = data[pos..body_start].to_vec();
-        header[22..26].fill(0);
-        if crc_update(crc_update(0, &header), &data[body_start..body_end]) != stored {
-            return None;
-        }
-
-        // A BOS page whose body starts with the FLAC mapping header opens a stream.
-        let body = &data[body_start..body_end];
-        if flags & 0x02 != 0
-            && body.len() >= 5
-            && body[0] == 0x7F
-            && &body[1..5] == b"FLAC"
-            && !active.iter().any(|a| a.serial == serial)
-        {
-            active.push(Active {
-                serial,
-                stream: streams.len(),
-                partial: Vec::new(),
-            });
-            streams.push(Vec::new());
-        }
-
-        if let Some(i) = active.iter().position(|a| a.serial == serial) {
-            let a = &mut active[i];
-            let mut boff = body_start;
-            for &lv in &data[seg_table..body_start] {
-                let lv = lv as usize;
-                a.partial.extend_from_slice(&data[boff..boff + lv]);
-                boff += lv;
-                if lv < 255 {
-                    streams[a.stream].push(std::mem::take(&mut a.partial));
-                }
-            }
-            if flags & 0x04 != 0 {
-                active.remove(i);
-                ended += 1;
-            }
-        }
-        pos = body_end;
+    if &data[..4] != b"OggS" {
+        return None;
     }
-    Some(streams)
+    let nsegs = data[26] as usize;
+    let body_start = 27 + nsegs;
+    if data.len() < body_start {
+        return Some(PageParse::NeedMore(body_start));
+    }
+    let lacing = &data[27..body_start];
+    let body_end = body_start + lacing.iter().map(|&b| b as usize).sum::<usize>();
+    if data.len() < body_end {
+        return Some(PageParse::NeedMore(body_end));
+    }
+
+    // Verify the page CRC over the header (CRC field zeroed) + body.
+    let stored = u32::from_le_bytes(data[22..26].try_into().ok()?);
+    let mut header = data[..body_start].to_vec();
+    header[22..26].fill(0);
+    if crc_update(crc_update(0, &header), &data[body_start..body_end]) != stored {
+        return None;
+    }
+    Some(PageParse::Page(
+        Page {
+            flags: data[5],
+            serial: u32::from_le_bytes(data[14..18].try_into().ok()?),
+            lacing,
+            body: &data[body_start..body_end],
+        },
+        body_end,
+    ))
 }

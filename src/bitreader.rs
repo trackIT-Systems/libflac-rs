@@ -15,11 +15,23 @@ pub struct BitReader<'a> {
     data: &'a [u8],
     /// Absolute position in bits from the start of `data`.
     pos: usize,
+    /// A read failed because `data` ended (rather than because a value was
+    /// invalid), so more input might complete it.
+    ran_out: bool,
 }
 
 impl<'a> BitReader<'a> {
     pub fn new(data: &'a [u8]) -> Self {
-        Self { data, pos: 0 }
+        Self {
+            data,
+            pos: 0,
+            ran_out: false,
+        }
+    }
+
+    /// Whether a read failed for lack of data (see the field).
+    pub fn ran_out(&self) -> bool {
+        self.ran_out
     }
 
     /// Current byte offset (only meaningful when byte-aligned).
@@ -42,6 +54,7 @@ impl<'a> BitReader<'a> {
             return Some(0);
         }
         if bits as usize > self.bits_left() {
+            self.ran_out = true;
             return None;
         }
         let mut v = 0u32;
@@ -176,6 +189,7 @@ impl<'a> BitReader<'a> {
     pub fn skip_bytes(&mut self, n: usize) -> Option<()> {
         debug_assert!(self.is_byte_aligned());
         if n * 8 > self.bits_left() {
+            self.ran_out = true;
             return None;
         }
         self.pos += n * 8;

@@ -259,7 +259,10 @@ residual/rice → CRC-16 — diffing at the first mismatching field.
   (`decode(encode(pcm)) == pcm`, all depths/levels, MD5 ok) and by **decoding real
   libFLAC output** (`decode_libflac_streams`). Phase 9 then added **SEEKTABLE-driven
   `seek()`** (`decode_seek`) and **variable-block-size** decoding (`read_utf8_u64`,
-  selected by the blocking-strategy bit). Remaining: a streaming/push API (Phase 11).
+  selected by the blocking-strategy bit). **Streaming:** `stream.rs`'s
+  `StreamDecoder` (any `Read`; native, raw frames, chained Ogg) is the decode core;
+  `decode`, `decode_frames`, `decode_ogg[_chained]` and `decode_with` (sample
+  limit) collect from it. Decoding stops at STREAMINFO's total when set.
   **D2 (libFLAC 1.5.0 decoder, issue #2):** frames are placed by their header
   numbers (`Timeline::place`, `read_frame_header_`'s fixed-block-size logic) and
   missing frames are filled with silence under libFLAC's rules (`Timeline::fill_gap`,

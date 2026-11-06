@@ -26,6 +26,8 @@ dependencies, no build script and no `unsafe`.
     tags, PADDING, APPLICATION, SEEKTABLE (filled in during encoding), CUESHEET,
     PICTURE
 - **Decoder**
+  - streaming from any `std::io::Read`, block by block with bounded memory, or
+    into memory with an optional sample limit
   - native and Ogg FLAC, including chained Ogg streams; fixed and variable block
     sizes
   - MD5 verification, SEEKTABLE-based seeking, tags
@@ -82,6 +84,32 @@ let flac = enc.encode_with_metadata(
 let decoded = libflac_rs::decode(&flac).unwrap();
 assert_eq!(decoded.vorbis_comment.unwrap().comments, ["TITLE=Night 1"]);
 ```
+
+For long streams, files read from disk or the network, or untrusted input, decode
+block by block instead of into memory. A few bytes of FLAC can legitimately decode
+to gigabytes (digital silence compresses extremely well):
+
+```rust
+use libflac_rs::{DecodeError, StreamDecoder};
+use std::{fs::File, io::BufReader};
+
+fn play(path: &str) -> Result<(), DecodeError> {
+    let mut decoder = StreamDecoder::new(BufReader::new(File::open(path)?))?;
+    let header = decoder.header();
+    println!("{} Hz, {} channels", header.sample_rate, header.channels);
+    for block in &mut decoder {
+        let block = block?; // one frame (or gap silence), interleaved
+        // ... process block.interleaved ...
+    }
+    assert_eq!(decoder.md5_ok(), Some(true));
+    Ok(())
+}
+```
+
+`decode_with(data, &DecodeOptions { max_samples: Some(n) })` decodes into memory
+but fails with `DecodeError::LimitExceeded` instead of growing past `n` samples
+per channel. All decoders stop at the sample count STREAMINFO declares, when it
+does.
 
 The full API is documented in the crate docs (`cargo doc --open`).
 

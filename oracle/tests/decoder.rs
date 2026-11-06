@@ -3,10 +3,11 @@
 //! chained Ogg links, and frames whose samples exceed their bit depth.
 
 use libflac_rs::{
-    Encoder, EncoderConfig, Gap, LIBFLAC_VENDOR_STRING, MetadataBlock, SeekPoint, decode,
-    decode_frames, decode_ogg, decode_ogg_chained, decode_seek,
+    Encoder, EncoderConfig, Gap, LIBFLAC_VENDOR_STRING, MetadataBlock, SeekPoint, StreamDecoder,
+    decode, decode_frames, decode_ogg, decode_ogg_chained, decode_seek,
 };
 use libflac_rs_oracle::{self as oracle, error};
+use std::io::Read;
 
 mod common;
 use common::signal;
@@ -429,4 +430,56 @@ fn crc16(data: &[u8]) -> u16 {
         }
         crc
     })
+}
+
+/// Hands out at most 5 bytes per `read`, so every frame and page arrives split.
+struct Trickle<'a>(&'a [u8]);
+
+impl Read for Trickle<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let k = buf.len().min(5).min(self.0.len());
+        buf[..k].copy_from_slice(&self.0[..k]);
+        self.0 = &self.0[k..];
+        Ok(k)
+    }
+}
+
+/// All links of `data`, decoded block by block through a trickling reader.
+fn stream_links(data: &[u8]) -> Vec<Vec<i32>> {
+    let mut dec = StreamDecoder::new(Trickle(data)).unwrap();
+    let mut links = Vec::new();
+    loop {
+        let mut pcm = Vec::new();
+        for block in dec.by_ref() {
+            pcm.extend(block.unwrap().interleaved);
+        }
+        links.push(pcm);
+        if !dec.next_link().unwrap() {
+            return links;
+        }
+    }
+}
+
+/// The streaming decoder produces what libFLAC's decoder does: damaged native
+/// streams (silence included) and every link of a chained Ogg stream.
+#[test]
+fn stream_decoder_matches_libflac() {
+    let pcm = signal(2, 16, 4096, 8, 21);
+    let f = framed(
+        EncoderConfig::new(2, 16, 44_100).with_block_size(4096),
+        &pcm,
+    );
+    let damaged = [f.header.clone(), f.without(2..5)].concat();
+    let c = oracle::decode(&damaged, false, false);
+    assert_eq!(stream_links(&damaged), [c.links[0].interleaved.clone()]);
+
+    let mut chained = Vec::new();
+    for (channels, bps, rate, serial) in [(1, 16, 44_100, 1), (2, 24, 96_000, 2)] {
+        let pcm = signal(channels, bps, 4096, 3, u64::from(rate));
+        chained
+            .extend(Encoder::new(EncoderConfig::new(channels, bps, rate)).encode_ogg(&pcm, serial));
+    }
+    let c = oracle::decode(&chained, true, true);
+    let expected: Vec<Vec<i32>> = c.links.into_iter().map(|l| l.interleaved).collect();
+    assert_eq!(stream_links(&chained), expected);
 }

@@ -12,7 +12,8 @@
 //!   depths (8/12/16/20/24/32), mono / stereo (with mid-side decorrelation) /
 //!   multichannel, every metadata block (STREAMINFO, VORBIS_COMMENT, PADDING,
 //!   APPLICATION, SEEKTABLE, PICTURE, CUESHEET), and the audio MD5.
-//! - **Decoder**: lossless and MD5-verified, with [`decode_seek`], variable block
+//! - **Decoder**: lossless and MD5-verified, streaming ([`StreamDecoder`]) or
+//!   into memory, with [`decode_seek`], variable block
 //!   sizes, chained Ogg ([`decode_ogg_chained`]), and missing frames filled with
 //!   silence as libFLAC 1.5.0 does ([`Gap`]).
 //! - **Ogg FLAC** ([`Encoder::encode_ogg`] / [`decode_ogg`]), byte-identical to
@@ -42,6 +43,12 @@
 //! assert_eq!(decoded.interleaved, pcm);
 //! assert!(decoded.md5_ok);
 //! ```
+//! The whole-buffer functions hold the entire decoded stream in memory, and a few
+//! bytes of FLAC can decode to gigabytes. For long streams, reading from files or
+//! sockets, or untrusted input, use [`StreamDecoder`], which yields one block at a
+//! time from any [`std::io::Read`]; or cap the output with [`decode_with`] and
+//! [`DecodeOptions::max_samples`]. Decoding stops at STREAMINFO's sample count when
+//! it is set.
 //!
 //! See `ROADMAP.md` for the milestone history and `ORACLE.md` for how byte-exactness
 //! is re-verified against the C reference.
@@ -62,15 +69,17 @@ mod md5;
 mod metadata;
 mod ogg;
 mod rice;
+mod stream;
 mod subframe;
 mod window;
 
 pub use decoder::{
-    DecodedFrames, DecodedStream, DecodedVorbisComment, Gap, SeekResult, decode, decode_frames,
-    decode_ogg, decode_ogg_chained, decode_seek,
+    DecodedFrames, DecodedStream, DecodedVorbisComment, Gap, SeekResult, StreamHeader, decode,
+    decode_frames, decode_ogg, decode_ogg_chained, decode_seek, decode_with,
 };
 pub use encoder::{Encoder, EncoderConfig};
 pub use metadata::{
     CueSheetIndex, CueSheetTrack, LIBFLAC_VENDOR_STRING, MetadataBlock, SeekPoint,
     spaced_seek_points, vorbis_comment_entry,
 };
+pub use stream::{DecodeError, DecodeOptions, DecodedBlock, StreamDecoder};
