@@ -153,7 +153,8 @@ impl DecodedStream {
     ) -> Self {
         // Trim any encoder padding beyond the declared length.
         if info.total_samples > 0 {
-            interleaved.truncate(info.total_samples as usize * info.channels as usize);
+            interleaved
+                .truncate((info.total_samples as usize).saturating_mul(info.channels as usize));
         }
         let md5_ok = info.md5 == [0u8; 16]
             || crate::md5::audio_md5(&interleaved, info.bits_per_sample.div_ceil(8) as usize)
@@ -256,7 +257,7 @@ impl Timeline {
     fn fill_gap(&mut self, start: u64, frame: &Frame, out: &mut Vec<i32>) {
         let format = self.format(frame);
         if let Some((last_start, last_bs, last_rate, last_ch, last_bps)) = self.last {
-            let end = last_start + last_bs;
+            let end = last_start.saturating_add(last_bs);
             if end < start {
                 let missing = start - end;
                 let filled = if (last_rate, last_ch, last_bps) == format && last_bs >= 16 {
@@ -426,7 +427,7 @@ pub fn decode_seek(data: &[u8], target_sample: u64) -> Option<SeekResult> {
         if first_sample.is_none() {
             // Skip frames before the target; emit the part at or after it.
             timeline.remember(start, &frame);
-            if start + frame.blocksize as u64 > target_sample {
+            if start.saturating_add(frame.blocksize as u64) > target_sample {
                 let skip = target_sample.saturating_sub(start);
                 first_sample = Some(start + skip);
                 push_samples(&frame, skip as usize, &mut interleaved);
@@ -438,8 +439,8 @@ pub fn decode_seek(data: &[u8], target_sample: u64) -> Option<SeekResult> {
     }
     let first_sample = first_sample.unwrap_or(target_sample);
     if info.total_samples != 0 {
-        let want =
-            info.total_samples.saturating_sub(first_sample) as usize * info.channels as usize;
+        let want = (info.total_samples.saturating_sub(first_sample) as usize)
+            .saturating_mul(info.channels as usize);
         interleaved.truncate(want);
     }
 
@@ -670,13 +671,23 @@ fn decode_frame(br: &mut BitReader, data: &[u8]) -> Option<Frame> {
 }
 
 /// Decode one subframe to its (wasted-bits-restored) `i64` channel signal.
+///
+/// Malformed input is rejected with `None` where libFLAC drops the frame
+/// (`read_subframe_`, `stream_decoder.c:2967` ff.): wasted bits not below the
+/// channel's bit depth, a reserved FIXED order or LPC precision, a negative LPC
+/// shift, and the residual checks in [`decode_residual`]. Prediction arithmetic
+/// wraps instead of overflowing, as garbage that gets this far is caught by the
+/// frame CRC and the bit-depth check.
 fn decode_subframe(br: &mut BitReader, blocksize: usize, channel_bps: u32) -> Option<Vec<i64>> {
     let header = br.read_raw_u32(8)?;
     let wasted = if header & 1 == 1 {
-        br.read_unary()? + 1
+        br.read_unary()?.checked_add(1)?
     } else {
         0
     };
+    if wasted >= channel_bps {
+        return None;
+    }
     let type6 = (header >> 1) & 0x3f;
     let subframe_bps = channel_bps - wasted;
 
@@ -698,6 +709,9 @@ fn decode_subframe(br: &mut BitReader, blocksize: usize, channel_bps: u32) -> Op
         }
         let precision = br.read_raw_u32(4)? + 1;
         let shift = sign_extend5(br.read_raw_u32(5)?);
+        if precision == 16 || shift < 0 {
+            return None; // precision code 15 is reserved; the shift must be >= 0
+        }
         let mut qlp = vec![0i32; order];
         for c in qlp.iter_mut() {
             *c = br.read_signed(precision)? as i32;
@@ -706,26 +720,33 @@ fn decode_subframe(br: &mut BitReader, blocksize: usize, channel_bps: u32) -> Op
         for i in order..blocksize {
             let mut sum = 0i64;
             for (j, &c) in qlp.iter().enumerate() {
-                sum += c as i64 * data[i - 1 - j];
+                sum = sum.wrapping_add((c as i64).wrapping_mul(data[i - 1 - j]));
             }
-            data[i] = residual[i - order] as i64 + (sum >> shift);
+            data[i] = (residual[i - order] as i64).wrapping_add(sum >> shift);
         }
     } else if type6 & 0x08 != 0 {
-        // FIXED, order = type6 & 0x07
+        // FIXED, order = type6 & 0x07 (5..7 reserved)
         let order = (type6 & 0x07) as usize;
+        if order > 4 {
+            return None;
+        }
         for d in data.iter_mut().take(order) {
             *d = br.read_signed(subframe_bps)?;
         }
         let residual = decode_residual(br, blocksize, order)?;
         for i in order..blocksize {
             let r = residual[i - order] as i64;
-            data[i] = match order {
-                0 => r,
-                1 => r + data[i - 1],
-                2 => r + 2 * data[i - 1] - data[i - 2],
-                3 => r + 3 * data[i - 1] - 3 * data[i - 2] + data[i - 3],
-                _ => r + 4 * data[i - 1] - 6 * data[i - 2] + 4 * data[i - 3] - data[i - 4],
+            // The fixed predictors' coefficients, newest sample first.
+            let taps: &[i64] = match order {
+                0 => &[],
+                1 => &[1],
+                2 => &[2, -1],
+                3 => &[3, -3, 1],
+                _ => &[4, -6, 4, -1],
             };
+            data[i] = taps.iter().enumerate().fold(r, |acc, (j, &t)| {
+                acc.wrapping_add(t.wrapping_mul(data[i - 1 - j]))
+            });
         }
     } else {
         return None; // reserved subframe type
@@ -739,13 +760,23 @@ fn decode_subframe(br: &mut BitReader, blocksize: usize, channel_bps: u32) -> Op
     Some(data)
 }
 
-/// Decode the partitioned-Rice residual (`blocksize - order` values).
+/// Decode the partitioned-Rice residual (`blocksize - order` values). `None` for a
+/// reserved coding method, or partitions that do not divide the block or are
+/// smaller than the predictor order (`read_residual_partitioned_rice_`,
+/// `stream_decoder.c:3110`).
 fn decode_residual(br: &mut BitReader, blocksize: usize, order: usize) -> Option<Vec<i32>> {
-    let is_rice2 = br.read_raw_u32(2)? == 1;
+    let method = br.read_raw_u32(2)?;
+    if method > 1 {
+        return None;
+    }
+    let is_rice2 = method == 1;
     let param_len = if is_rice2 { 5 } else { 4 };
     let escape = if is_rice2 { 31 } else { 15 };
     let partition_order = br.read_raw_u32(4)?;
     let partitions = 1usize << partition_order;
+    if blocksize >> partition_order < order || blocksize % partitions != 0 {
+        return None;
+    }
 
     let mut residual = vec![0i32; blocksize - order];
     let mut idx = 0usize;
@@ -783,13 +814,13 @@ fn undecorrelate(
         ChannelAssignment::LeftSide => {
             // ch0 = left, ch1 = side = left - right -> right = left - side.
             let (l, s) = (&chans[0], &chans[1]);
-            let right = (0..blocksize).map(|i| l[i] - s[i]).collect();
+            let right = (0..blocksize).map(|i| l[i].wrapping_sub(s[i])).collect();
             vec![l.clone(), right]
         }
         ChannelAssignment::RightSide => {
             // ch0 = side = left - right, ch1 = right -> left = right + side.
             let (s, r) = (&chans[0], &chans[1]);
-            let left = (0..blocksize).map(|i| r[i] + s[i]).collect();
+            let left = (0..blocksize).map(|i| r[i].wrapping_add(s[i])).collect();
             vec![left, r.clone()]
         }
         ChannelAssignment::MidSide => {
@@ -801,8 +832,8 @@ fn undecorrelate(
             for i in 0..blocksize {
                 let side = s[i];
                 let mid2 = (m[i] << 1) | (side & 1);
-                left[i] = (mid2 + side) >> 1;
-                right[i] = (mid2 - side) >> 1;
+                left[i] = mid2.wrapping_add(side) >> 1;
+                right[i] = mid2.wrapping_sub(side) >> 1;
             }
             vec![left, right]
         }
@@ -1131,6 +1162,87 @@ mod tests {
         assert_eq!(decode_frames(&frame(0)).unwrap().interleaved, [127; 32]);
         // side = -128 (9-bit two's complement): right = 127 + 128 = 255.
         assert!(decode_frames(&frame(0x180)).is_none());
+    }
+
+    /// A mono 8-bit frame of `blocksize` (1..=256) samples at 44.1 kHz with one
+    /// subframe written by `subframe`, and valid CRCs.
+    fn mono_frame(blocksize: u32, subframe: impl Fn(&mut BitWriter)) -> Vec<u8> {
+        let mut bw = BitWriter::new();
+        bw.write_raw_u32(0x3FFE, 14); // sync
+        bw.write_raw_u32(0, 2); // reserved, fixed block size
+        bw.write_raw_u32(6, 4); // block size: 8-bit field follows
+        bw.write_raw_u32(9, 4); // 44.1 kHz
+        bw.write_raw_u32(0, 4); // mono
+        bw.write_raw_u32(1, 3); // 8 bits per sample
+        bw.write_raw_u32(0, 1); // reserved
+        bw.write_raw_u32(0, 8); // frame number 0
+        bw.write_raw_u32(blocksize - 1, 8);
+        let crc = bw.crc8();
+        bw.write_raw_u32(crc as u32, 8);
+        subframe(&mut bw);
+        bw.zero_pad_to_byte_boundary();
+        let crc = bw.crc16();
+        bw.write_raw_u32(crc as u32, 16);
+        bw.as_bytes().to_vec()
+    }
+
+    /// Fields libFLAC rejects (`stream_decoder.c:2967`, `:3110`, `:3179-3190`) make
+    /// the decode fail instead of panicking or decoding garbage.
+    #[test]
+    fn rejects_malformed_subframes() {
+        // Control: CONSTANT 5.
+        let valid = mono_frame(16, |bw| {
+            bw.write_raw_u32(0x00, 8);
+            bw.write_raw_u32(5, 8);
+        });
+        assert_eq!(decode_frames(&valid).unwrap().interleaved, [5; 16]);
+
+        type WriteSubframe<'a> = &'a dyn Fn(&mut BitWriter);
+        let cases: [(&str, u32, WriteSubframe); 7] = [
+            ("wasted bits = bit depth", 16, &|bw| {
+                bw.write_raw_u32(0x01, 8); // CONSTANT, wasted-bits flag
+                bw.write_raw_u32(1, 8); // unary 7: 8 wasted bits
+            }),
+            ("negative LPC shift", 16, &|bw| {
+                bw.write_raw_u32(0x40, 8); // LPC order 1
+                bw.write_raw_u32(5, 8); // warm-up
+                bw.write_raw_u32(3, 4); // precision 4
+                bw.write_raw_u32(0x1F, 5); // shift -1
+                bw.write_raw_u32(1, 4);
+            }),
+            ("LPC precision code 15", 16, &|bw| {
+                bw.write_raw_u32(0x40, 8);
+                bw.write_raw_u32(5, 8);
+                bw.write_raw_u32(15, 4);
+                bw.write_raw_u32(0, 5);
+            }),
+            ("FIXED order 5", 16, &|bw| {
+                bw.write_raw_u32(0x1A, 8);
+                bw.write_raw_u32(0, 32); // warm-up
+                bw.write_raw_u32(0, 8);
+            }),
+            ("residual method 2", 16, &|bw| {
+                bw.write_raw_u32(0x10, 8); // FIXED order 0
+                bw.write_raw_u32(2, 2);
+            }),
+            ("partition smaller than the order", 16, &|bw| {
+                bw.write_raw_u32(0x14, 8); // FIXED order 2
+                bw.write_raw_u32(0, 16); // warm-up
+                bw.write_raw_u32(0, 2); // RICE
+                bw.write_raw_u32(4, 4); // 16 partitions of 1 sample
+            }),
+            ("partitions not dividing the block", 17, &|bw| {
+                bw.write_raw_u32(0x10, 8); // FIXED order 0
+                bw.write_raw_u32(0, 2);
+                bw.write_raw_u32(1, 4); // 2 partitions of 17 samples
+            }),
+        ];
+        for (label, blocksize, subframe) in cases {
+            assert!(
+                decode_frames(&mono_frame(blocksize, subframe)).is_none(),
+                "{label}"
+            );
+        }
     }
 
     /// Chained Ogg FLAC: `decode_ogg` takes the first link, `decode_ogg_chained`

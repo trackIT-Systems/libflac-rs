@@ -73,14 +73,14 @@ impl<'a> BitReader<'a> {
     }
 
     /// Count zero bits up to and consuming the terminating `1`
-    /// (`FLAC__bitreader_read_unary_unsigned`).
+    /// (`FLAC__bitreader_read_unary_unsigned`); `None` past `u32::MAX`.
     pub fn read_unary(&mut self) -> Option<u32> {
         let mut count = 0u32;
         loop {
             if self.read_raw_u32(1)? == 1 {
                 return Some(count);
             }
-            count += 1;
+            count = count.checked_add(1)?;
         }
     }
 
