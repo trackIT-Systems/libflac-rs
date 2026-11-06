@@ -1,82 +1,71 @@
 # libflac-rs
 
-A pure-Rust, **bit-exact** port of [libFLAC](https://xiph.org/flac/) 1.5.0 — a
-complete FLAC **encoder and decoder** whose output is **byte-identical** to the C
-reference. Unlike a "produces valid FLAC" library, the goal is to *recreate the
-exact bytes* libFLAC/MAME produce, so tools like `chd-rs` can reproduce and verify
-CHD files losslessly. (`flacenc`, the existing pure-Rust encoder, is **not**
-byte-identical to libFLAC — which is precisely why this exists.)
+[![CI](https://github.com/trackIT-Systems/libflac-rs/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/trackIT-Systems/libflac-rs/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/trackIT-Systems/libflac-rs)](https://github.com/trackIT-Systems/libflac-rs/releases)
+[![MSRV](https://img.shields.io/badge/rustc-1.85+-blue)](Cargo.toml)
+[![License](https://img.shields.io/badge/license-BSD--3--Clause-blue)](LICENSE)
 
-## Status — complete and byte-exact
+A FLAC encoder and decoder in pure Rust whose encoder output is **byte-identical to
+[libFLAC](https://xiph.org/flac/) 1.5.0** at the same settings.
 
-Every byte is verified **against the real libFLAC** (and libogg for Ogg), compiled
-from source by the separate `oracle/` test crate — the library itself is 100% pure
-Rust. See [`ORACLE.md`](ORACLE.md):
+Most FLAC encoders produce valid FLAC; this one produces *libFLAC's* FLAC, down to
+the last byte. That matters when bytes must be reproduced rather than just decoded:
+recreating the audio in MAME CHD files, verifying archives against reference
+encodes, or replacing libFLAC in a pipeline without changing its output. It has no
+dependencies, no build script and no `unsafe`.
 
-- ✅ **Encoder**, byte-identical to libFLAC: compression levels **0–8**, bit depths
-  **8/12/16/20/24/32**, mono / stereo (mid-side) / multichannel, the audio MD5, and
-  every metadata block (STREAMINFO, VORBIS_COMMENT, PADDING, APPLICATION, SEEKTABLE,
-  PICTURE, CUESHEET).
-- ✅ **Decoder**: lossless and MD5-verified, with `seek()` and variable-block-size
-  support.
-- ✅ **Ogg FLAC** (encode + decode), byte-identical to libFLAC + libogg.
-- ✅ Pure Rust, `#![forbid(unsafe_code)]`, **zero runtime dependencies**.
+## Features
 
-### libFLAC 1.5.0 vs. 1.4.3
-
-Since 0.150.0 the target is libFLAC **1.5.0** (0.143.x targeted 1.4.3). The encoder
-output differs from 1.4.3 only where 1.5.0 changed it:
-
-- **Loose mid-side** (compression levels 1 and 4, stereo): a per-frame heuristic on
-  the first differences of L/R vs. M/S replaces the re-decision every ~0.4 s.
-- **Constant signals at 28–33-bit subframes** (32-bit input, non-zero value) are
-  coded as CONSTANT instead of FIXED.
-- **SEEKTABLE templates**: targets past the end of the stream become placeholders.
-- The default **vendor string** is `reference libFLAC 1.5.0 20250211`.
-
-None of these touch MAME/CHD's configuration (level 8, 16-bit stereo, raw frames),
-so CHD audio stays byte-identical to the libFLAC 1.4.3 that MAME ships.
-
-### Platform
-
-Like libFLAC, the encoder uses the platform's math library (`cosf` for the
-apodization windows, `log` for bit estimates), whose last-bit rounding differs
-between glibc, musl and macOS. The output is byte-identical to libFLAC **built on
-the same platform**, and can differ between platforms in rare cases (14 of 2916
-test streams between glibc and musl). CI checks against libFLAC on glibc and musl;
-see [`ORACLE.md`](ORACLE.md).
+- **Encoder**
+  - compression levels 0–8 with libFLAC's presets
+  - 8, 12, 16, 20, 24 and 32 bits per sample
+  - 1–8 channels, with mid/side stereo decorrelation
+  - output as a complete `.flac` file, as raw frames (what MAME/CHD stores), or as
+    Ogg FLAC
+  - every metadata block: STREAMINFO (with the audio MD5), VORBIS_COMMENT with
+    tags, PADDING, APPLICATION, SEEKTABLE (filled in during encoding), CUESHEET,
+    PICTURE
+- **Decoder**
+  - native and Ogg FLAC, fixed and variable block sizes
+  - MD5 verification, SEEKTABLE-based seeking, tags
+  - lossless: it decodes everything the encoder produces and libFLAC's output
+- Pure Rust, `#![forbid(unsafe_code)]`, zero dependencies, Rust 1.85+
 
 ## Installation
 
-Released as GitHub releases of this repository (not on crates.io):
+Releases are published on GitHub, not on crates.io:
 
 ```toml
 [dependencies]
 libflac-rs = { git = "https://github.com/trackIT-Systems/libflac-rs", tag = "v0.150.1" }
 ```
 
-See [`CHANGELOG.md`](CHANGELOG.md) for what changed.
+What changed between versions is in [`CHANGELOG.md`](CHANGELOG.md).
 
 ## Usage
 
 ```rust
 use libflac_rs::{Encoder, EncoderConfig};
 
-// 2-channel, 16-bit, 44.1 kHz, compression level 8 (libFLAC's defaults).
+// 2 channels, 16 bits, 44.1 kHz at libFLAC's defaults (level 8, MD5 on).
 let enc = Encoder::new(EncoderConfig::new(2, 16, 44_100));
 let pcm: Vec<i32> = vec![0; 4096 * 2]; // interleaved: L R L R …
 
-let flac: Vec<u8> = enc.encode(&pcm);      // a complete .flac file
-let frames: Vec<u8> = enc.encode_frames(&pcm); // raw frames (what MAME/CHD embeds)
-let ogg: Vec<u8> = enc.encode_ogg(&pcm, 0);    // an Ogg FLAC stream
+let flac: Vec<u8> = enc.encode(&pcm);          // a complete .flac file
+let frames: Vec<u8> = enc.encode_frames(&pcm); // raw frames, as MAME/CHD stores them
+let ogg: Vec<u8> = enc.encode_ogg(&pcm, 0);    // Ogg FLAC, logical stream serial 0
 
 let decoded = libflac_rs::decode(&flac).unwrap();
 assert_eq!(decoded.interleaved, pcm);
 assert!(decoded.md5_ok);
 ```
 
-To tag a file, add a VORBIS_COMMENT block with user comments; entries are checked
-the way libFLAC checks them:
+Settings are adjusted with `with_compression_level`, `with_block_size` and
+`with_md5`. For MAME's CHD audio codec (level 8, 2 channels, 16 bits, 44.1 kHz, MD5
+off), use `EncoderConfig::chd(block_size)` with `encode_frames`.
+
+Tags go into a VORBIS_COMMENT block; `vorbis_comment_entry` checks names and values
+the way libFLAC does:
 
 ```rust
 use libflac_rs::{Encoder, EncoderConfig, LIBFLAC_VENDOR_STRING, MetadataBlock, vorbis_comment_entry};
@@ -92,29 +81,41 @@ let decoded = libflac_rs::decode(&flac).unwrap();
 assert_eq!(decoded.vorbis_comment.unwrap().comments, ["TITLE=Night 1"]);
 ```
 
-For the exact configuration MAME's CHD codec uses (level 8, 2ch/16-bit/44.1 kHz,
-MD5 off), construct with `EncoderConfig::chd(block_size)` and call `encode_frames`.
+The full API is documented in the crate docs (`cargo doc --open`).
 
-## Pure Rust, zero dependencies
+## Compatibility
 
-The crate is `#![forbid(unsafe_code)]`, edition 2024, with **no dependencies at all**
-— not even a build script. There is no C in the repository.
+- **libFLAC version.** 0.150.x matches libFLAC 1.5.0; 0.143.x matched 1.4.3. The two
+  differ only where 1.5.0 changed the encoder: loose mid-side at levels 1 and 4,
+  constant 32-bit signals, seektable targets past the end, and the vendor string
+  (details in [`CHANGELOG.md`](CHANGELOG.md)).
+- **MAME / CHD.** The CHD configuration is unaffected by those changes, so CHD audio
+  stays byte-identical to the libFLAC 1.4.3 that MAME ships.
+- **Platforms.** Like libFLAC, the encoder takes `cos` and `log` from the platform's
+  math library, whose last-bit rounding differs between glibc, musl and macOS. The
+  output matches libFLAC built on the same platform and can differ between
+  platforms in rare cases. Measurements are in [`ORACLE.md`](ORACLE.md).
+- **Decoder.** The decoder is checked for losslessness, not byte parity, and does
+  not yet include libFLAC 1.5.0's decoder additions such as chained Ogg streams
+  ([#2](https://github.com/trackIT-Systems/libflac-rs/issues/2)).
+
+## How it is verified
+
+The separate `oracle/` crate compiles the C libFLAC 1.5.0 and libogg 1.3.5 from the
+Xiph release tags and compares complete encoder outputs byte for byte, through the
+public API. It covers all levels, bit depths, channel counts, block sizes, sample
+rates and metadata blocks, and runs in CI on glibc and musl. The library itself
+never builds C.
 
 ```sh
-cargo test   # pure-Rust unit + lossless round-trip tests (any platform)
+cargo test                                            # the library: unit and round-trip tests
+oracle/fetch-sources.sh && (cd oracle && cargo test)  # against the C reference
 ```
 
-Byte-exactness against the C reference is checked by the `oracle/` crate, which
-compiles libFLAC 1.5.0 + libogg 1.3.5 and diffs complete outputs (CI runs it under
-glibc, the libm parity target MAME/chdman use):
-
-```sh
-oracle/fetch-sources.sh && (cd oracle && cargo test)
-```
-
-See [`ORACLE.md`](ORACLE.md).
+[`ORACLE.md`](ORACLE.md) describes the oracle; [`ROADMAP.md`](ROADMAP.md) records how
+the port was built.
 
 ## License
 
-BSD-3-Clause, retaining the Xiph.Org copyrights on the ported libFLAC and libogg
-sources. See [`LICENSE`](LICENSE).
+BSD-3-Clause, retaining the Xiph.Org copyrights of the ported libFLAC and libogg
+code. See [`LICENSE`](LICENSE).
