@@ -15,6 +15,10 @@ CUESHEET), a complete decoder with `seek()` and variable-block-size support,
 documented, zero-dependency **public API** (`Encoder`/`EncoderConfig` + `decode*`).
 All that remains is dispatching the crates.io release (a maintainer action).
 
+**Since 0.150.0 the target is libFLAC 1.5.0.** The phases below record the 1.4.3
+bring-up (C line citations there refer to 1.4.3); the retarget is milestone R1 in
+`CLAUDE.md`, and the README lists what differs between the two.
+
 The C differential oracle that established byte-exactness is **no longer vendored** —
 the library is 100% pure Rust (no C, no build script, no dependencies). Byte-exactness
 is checked by the separate `oracle/` crate, which fetches and compiles libFLAC +

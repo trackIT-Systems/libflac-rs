@@ -41,7 +41,7 @@ jobs:
           RUSTDOCFLAGS: -D warnings
 
   # Byte-exactness against the C reference: the `oracle/` crate compiles libFLAC
-  # 1.4.3 + libogg 1.3.5 (fetched from the Xiph tags) and diffs complete outputs
+  # 1.5.0 + libogg 1.3.5 (fetched from the Xiph tags) and diffs complete outputs
   # through the public API. glibc only: it is the project's float-parity reference
   # (cosf, lround), and another libm on the C side may round differently.
   oracle:

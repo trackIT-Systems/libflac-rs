@@ -18,7 +18,7 @@ pub struct RicePartition {
     pub parameters: Vec<u32>,
     /// True if any parameter reaches the RICE escape value (15), so the subframe
     /// must use PARTITIONED_RICE2 (5-bit parameters) — only possible above 16 bps
-    /// (`find_best_partition_order_`, `stream_encoder.c:4172`).
+    /// (`find_best_partition_order_`, `stream_encoder.c:4774`).
     pub is_rice2: bool,
 }
 
@@ -45,7 +45,7 @@ fn max_partition_order_limited(limit: u32, blocksize: u32, predictor_order: u32)
 }
 
 /// Per-partition |residual| sums, laid out highest-order-first:
-/// `[2^max .. 2^min]` (`precompute_partition_info_sums_`, `stream_encoder.c:4183`).
+/// `[2^max .. 2^min]` (`precompute_partition_info_sums_`, `stream_encoder.c:4785`).
 /// Always accumulates in 64 bits (the C's 32-bit fast path yields the same sums).
 fn precompute_partition_info_sums(
     residual: &[i32],
@@ -141,7 +141,7 @@ fn set_partitioned_rice(
 
         let mean = abs_sums[partition];
         // Match libFLAC's short-circuit (`set_partitioned_rice_`,
-        // stream_encoder.c:4403): the `(mean-1)*divisor` product is only formed when
+        // stream_encoder.c:5005): the `(mean-1)*divisor` product is only formed when
         // `mean >= 2`, so an all-zero partition (`mean == 0`) never underflows. The
         // `wrapping_mul` matches the C's well-defined `u64` wrap for huge blocksizes.
         let mut rice_parameter = if mean < 2 {

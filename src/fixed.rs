@@ -7,22 +7,23 @@
 
 use crate::format::MAX_FIXED_ORDER;
 
-/// Pick the fixed predictor order 0..=4 and its estimated residual bits-per-sample
-/// (`FLAC__fixed_compute_best_predictor*`, `fixed.c:222/301/377/424`). The bps
-/// estimate is what `process_subframe_` (`stream_encoder.c:3561`) compares against
-/// `subframe_bps` to decide whether the fixed subframe is even worth evaluating.
-/// Two selection modes match libFLAC's per-bps dispatch (`stream_encoder.c:3493`):
+/// Pick the fixed predictor order 0..=4 and fill libFLAC's per-order residual
+/// bits-per-sample estimates (`FLAC__fixed_compute_best_predictor*`,
+/// `fixed.c:222/301/377/424`). `process_subframe_` reads two entries: `[1] == 0.0`
+/// flags a possibly constant signal (`stream_encoder.c:4102`), and the chosen
+/// order's entry `>= subframe_bps` skips the fixed subframe (`:4154`). Two
+/// selection modes match libFLAC's per-bps dispatch (`stream_encoder.c:4086`):
 ///
 /// * `subframe_bps < 28` — the `_wide` path: the sum of `|residual|` for every
 ///   order over the **aligned** range `[MAX_FIXED_ORDER, len)`, lowest order
-///   preferred on ties; the estimate uses the chosen order's sum.
+///   preferred on ties; every order's estimate comes from its own sum.
 /// * `subframe_bps >= 28` — the `_limit_residual` path: each order's sum is taken
 ///   over its **own** valid range `[order, len)`, an order is invalid if any
 ///   single residual magnitude exceeds `i32::MAX`, and `CHECK_ORDER_IS_VALID`
-///   picks the smallest valid sum (lowest order on ties). Per the macro, the
-///   estimate uses `total_error_0` for whichever order won, or `34.0` if no order
-///   was valid (which then suppresses the fixed subframe).
-pub fn compute_best_predictor_order(signal: &[i64], subframe_bps: u32) -> (u32, f32) {
+///   (`fixed.c:356`) visits orders 0..4: an order that beats the smallest sum so
+///   far gets the estimate from its own sum, every other order `34.0`. (libFLAC
+///   1.4.3 used `total_error_0` for each; 1.5.0 fixed that.)
+pub fn compute_best_predictor_order(signal: &[i64], subframe_bps: u32) -> (u32, [f32; 5]) {
     let n = signal.len();
     let data_len = (n - MAX_FIXED_ORDER as usize) as f64; // = blocksize - 4
     if subframe_bps < 28 {
@@ -51,7 +52,7 @@ pub fn compute_best_predictor_order(signal: &[i64], subframe_bps: u32) -> (u32, 
         } else {
             4
         };
-        (order, rbps_estimate(te[order as usize], data_len))
+        (order, te.map(|t| rbps_estimate(t, data_len)))
     } else {
         // `_limit_residual` / `_limit_residual_33bit`: per-order ranges + validity.
         let imax = i32::MAX as u64;
@@ -90,21 +91,14 @@ pub fn compute_best_predictor_order(signal: &[i64], subframe_bps: u32) -> (u32, 
         // lowest-order preference (strict `<` and increasing order).
         let mut order = 0u32;
         let mut smallest = u64::MAX;
-        let mut found = false;
+        let mut rbps = [34.0f32; 5];
         for k in 0..5 {
             if valid[k] && te[k] < smallest {
                 order = k as u32;
                 smallest = te[k];
-                found = true;
+                rbps[k] = rbps_estimate(te[k], data_len);
             }
         }
-        // The macro computes the estimate from total_error_0 for the winning order,
-        // or marks it 34.0 (the no-valid-order sentinel).
-        let rbps = if found {
-            rbps_estimate(te[0], data_len)
-        } else {
-            34.0
-        };
         (order, rbps)
     }
 }

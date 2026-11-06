@@ -2,7 +2,7 @@
 //! `process_subframes_` / `process_subframe_` (`stream_encoder.c`).
 //! CONSTANT/VERBATIM/FIXED/LPC subframes and, for stereo, the per-frame mid-side
 //! channel decision (L/R vs L/S vs R/S vs M/S by estimated bits, including the
-//! `loose_mid_side` periodic-redecision mode). All compression levels 0–8 are
+//! `loose_mid_side` first-difference heuristic). All compression levels 0–8 are
 //! supported via [`Config`]/[`preset`] (the `tukey(0.5)` / `subdivide_tukey(2|3)`
 //! apodizations and the per-level LPC-order / partition-order caps). All bit depths
 //! 8/12/16/20/24/32 are supported — RICE2 entropy coding above 16 bps, and for
@@ -23,7 +23,7 @@ use crate::{fixed, lpc, metadata, ogg, rice, subframe, window};
 const MIN_RESIDUAL_PARTITION_ORDER: u32 = 0;
 
 /// The Rice parameter limit (escape value): RICE2 (31) above 16 bps, else RICE
-/// (15) (`process_subframe_`, `stream_encoder.c:3471`). Based on the *stream* bps.
+/// (15) (`process_subframe_`, `stream_encoder.c:4064`). Based on the *stream* bps.
 fn rice_parameter_limit(bits_per_sample: u32) -> u32 {
     if bits_per_sample > 16 {
         ENTROPY_CODING_METHOD_PARTITIONED_RICE2_ESCAPE_PARAMETER
@@ -64,7 +64,7 @@ impl Apodization {
 }
 
 /// The compression settings of one libFLAC compression level (the fields of
-/// `compression_levels_[]`, `stream_encoder.c:123`, that actually vary). The
+/// `compression_levels_[]`, `stream_encoder.c:131`, that actually vary). The
 /// constant fields — `min_residual_partition_order = 0`, `qlp_coeff_precision = 0`
 /// (auto), and the escape/exhaustive/precision-search flags all `false` — are
 /// implied.
@@ -104,7 +104,7 @@ pub fn preset(level: u32) -> Config {
 
 /// Detect and strip wasted (common trailing-zero) bits, mutating `signal` in
 /// place and returning the shift (`get_wasted_bits_` / `get_wasted_bits_wide_`,
-/// `stream_encoder.c:4469`/`4493`). `wide` selects the 33-bit-side variant, used
+/// `stream_encoder.c:5065`/`5089`). `wide` selects the 33-bit-side variant, used
 /// only for the side channel of 32-bit stereo: it differs solely in the all-zero
 /// case, returning shift **1** (so a 33-bit side always fits `i32` after the
 /// shift) where the narrow version returns 0.
@@ -128,7 +128,7 @@ pub(crate) fn get_wasted_bits(signal: &mut [i64], wide: bool) -> u32 {
     shift
 }
 
-/// Auto QLP-coefficient precision (`stream_encoder.c:704`), derived once at init
+/// Auto QLP-coefficient precision (`stream_encoder.c:764`), derived once at init
 /// from the *stream* bits-per-sample and the (full) block size; the short final
 /// frame reuses the same value.
 fn auto_qlp_coeff_precision(bits_per_sample: u32, blocksize: u32) -> u32 {
@@ -194,7 +194,7 @@ struct ChosenChannel {
 }
 
 /// Advance the `subdivide_tukey` a/b/c state to the next sub-window
-/// (`set_next_subdivide_tukey`, `stream_encoder.c:3686`). `a` = apodization index,
+/// (`set_next_subdivide_tukey`, `stream_encoder.c:4281`). `a` = apodization index,
 /// `depth` = subdivision denominator (b), `part` = interleaved partial/punchout
 /// counter (c).
 fn set_next_subdivide_tukey(parts: i32, a: &mut u32, depth: &mut u32, part: &mut u32) {
@@ -220,7 +220,7 @@ fn set_next_subdivide_tukey(parts: i32, a: &mut u32, depth: &mut u32, part: &mut
 }
 
 /// One step of the apodization state machine (`apply_apodization_`,
-/// `stream_encoder.c:3711`) for a `subdivide_tukey` apodization. Produces the LP
+/// `stream_encoder.c:4306`) for a `subdivide_tukey` apodization. Produces the LP
 /// coefficients and a guess order for the current sub-window, advancing `a/b/c`,
 /// or returns `None` to skip this sub-window (tiny block, or a constant signal).
 #[allow(clippy::too_many_arguments)]
@@ -288,7 +288,7 @@ fn apply_apodization(
 }
 
 /// Quantize + residual + rice + estimate for one (order, coefficient row)
-/// (`evaluate_lpc_subframe_`, `stream_encoder.c:3954`). Returns `None` when the
+/// (`evaluate_lpc_subframe_`, `stream_encoder.c:4552`). Returns `None` when the
 /// coefficients can't be quantized or the residual overflows i32 (the C returns 0,
 /// meaning "can't LPC at this order").
 #[allow(clippy::too_many_arguments)]
@@ -343,7 +343,7 @@ fn evaluate_lpc_subframe(
 }
 
 /// Best LPC subframe over all `subdivide_tukey` sub-windows (the LPC arm of
-/// `process_subframe_`, `stream_encoder.c:3594`). Each sub-window is evaluated at
+/// `process_subframe_`, `stream_encoder.c:4188`). Each sub-window is evaluated at
 /// its single guess order (no exhaustive/precision search at level 8). Returns the
 /// lowest-bit candidate, or `None` if none could be produced.
 #[allow(clippy::too_many_arguments)]
@@ -418,7 +418,7 @@ fn best_lpc_subframe(
 
 /// Choose the smallest-estimate subframe for one (already wasted-bits-shifted)
 /// channel block, returning the choice and its estimated bit cost
-/// (`process_subframe_`, `stream_encoder.c:3441`). VERBATIM is the baseline;
+/// (`process_subframe_`, `stream_encoder.c:4033`). VERBATIM is the baseline;
 /// CONSTANT wins for a single repeated value; otherwise FIXED and LPC compete. On
 /// ties the earlier candidate is kept (strict `<`). Writing is deferred so the
 /// mid-side channel decision can pick among already-evaluated subframes.
@@ -439,21 +439,22 @@ fn choose_subframe(
 
     if bs > MAX_FIXED_ORDER {
         // libFLAC's constant detection keys off `fixed_residual_bits_per_sample[1]
-        // == 0.0`, which the guess predictor only produces below 28 bps; at
-        // `subframe_bps >= 28` the `_limit_residual` predictor reports 34.0 even for
-        // a constant signal, so CONSTANT is never selected there (it becomes FIXED).
-        if subframe_bps < 28 && signal.iter().all(|&s| s == signal[0]) {
+        // == 0.0`, then double-checks that every sample is equal
+        // (`stream_encoder.c:4099`). At `subframe_bps >= 28` the `_limit_residual`
+        // predictor leaves `[1]` at 34.0 for an all-zero signal (order 0 already
+        // has the zero sum), which therefore becomes FIXED, not CONSTANT.
+        let (order, fixed_rbps) = fixed::compute_best_predictor_order(signal, subframe_bps);
+        if fixed_rbps[1] == 0.0 && signal.iter().all(|&s| s == signal[0]) {
             let cb = subframe::constant_bits(subframe_bps, wasted_bits);
             if cb < best_bits {
                 best_bits = cb;
                 best = Choice::Constant;
             }
         } else {
-            let (order, fixed_rbps) = fixed::compute_best_predictor_order(signal, subframe_bps);
             // libFLAC skips a fixed order whose estimated bits/sample already meets
-            // or exceeds the subframe bps (`process_subframe_`, stream_encoder.c:3561)
+            // or exceeds the subframe bps (`process_subframe_`, stream_encoder.c:4154)
             // — e.g. an incompressible/overflowing wide signal — leaving VERBATIM.
-            if (fixed_rbps) < subframe_bps as f32 {
+            if fixed_rbps[order as usize] < subframe_bps as f32 {
                 let residual = fixed::compute_residual(signal, order);
                 let (rice_part, residual_bits) = rice::find_best_partition_order(
                     &residual,
@@ -496,7 +497,7 @@ fn choose_subframe(
     (best, best_bits)
 }
 
-/// Write a previously-chosen subframe (`add_subframe_`, `stream_encoder.c:3787`).
+/// Write a previously-chosen subframe (`add_subframe_`, `stream_encoder.c:4383`).
 /// `signal` is the channel block the choice was made on (for warmup/raw samples).
 fn write_choice(
     bw: &mut BitWriter,
@@ -537,11 +538,11 @@ fn write_choice(
 }
 
 /// Mark every seek point whose target sample falls in the frame starting at
-/// `frame_first_sample` (`write_frame_`, `stream_encoder.c:2741`). The match range
+/// `frame_first_sample` (`write_frame_`, `stream_encoder.c:3058`). The match range
 /// and the recorded `frame_samples` use this frame's *actual* sample count
 /// (`blocksize`): libFLAC reads `get_blocksize()`, which equals the configured block
 /// size for every frame except the short final one, where `finish` lowers it to the
-/// remaining sample count (`stream_encoder.c:1493`). `stream_offset` is the frame's
+/// remaining sample count (`stream_encoder.c:1704`). `stream_offset` is the frame's
 /// byte offset from the first audio frame. `first` is the persistent
 /// `first_seekpoint_to_check` cursor; points are visited in (sorted) target order,
 /// and a claimed point's `sample_number` is rewritten to the frame's first sample,
@@ -573,10 +574,27 @@ fn fill_seekpoints(
     }
 }
 
+/// Loose mid-side decision (`stream_encoder.c:3766-3794`): independent coding when
+/// the summed absolute first differences of L and R are smaller than those of the
+/// mid/side pair built from them, mid/side otherwise (ties go to mid/side). The
+/// C sums in `uint64_t` over `int32_t` (`int64_t` from 25 bits) differences; `i64`
+/// is exact for both.
+fn loose_prefers_independent(left: &[i64], right: &[i64]) -> bool {
+    let (mut sum_lr, mut sum_ms) = (0u64, 0u64);
+    for i in 1..left.len() {
+        let l = left[i] - left[i - 1];
+        let r = right[i] - right[i - 1];
+        sum_lr += l.unsigned_abs() + r.unsigned_abs();
+        sum_ms += ((l + r) >> 1).unsigned_abs() + (l - r).unsigned_abs();
+    }
+    sum_lr < sum_ms
+}
+
 /// Encode interleaved integer PCM into FLAC audio frames (no metadata) with the
 /// given compression `config`. For stereo with `do_mid_side`, each frame picks the
-/// channel assignment with the fewest bits (or, with `loose_mid_side`, re-decides
-/// only every ~0.4 s and reuses it between). The block size is fixed except for a
+/// channel assignment with the fewest bits (or, with `loose_mid_side`, picks
+/// independent or mid/side up front by a first-difference heuristic). The block
+/// size is fixed except for a
 /// possibly shorter final frame.
 pub fn encode_frames(
     interleaved: &[i32],
@@ -631,16 +649,6 @@ fn encode_frames_inner(
     let mut window_bs = 0usize;
     let mut window_buf: Vec<f32> = Vec::new();
 
-    // Loose mid-side: re-decide the assignment only every `loose_frames` frames
-    // (`stream_encoder.c:894`), reusing it in between.
-    let loose_frames = if config.loose_mid_side {
-        ((sample_rate as f64 * 0.4 / blocksize as f64 + 0.5) as u32).max(1)
-    } else {
-        0
-    };
-    let mut loose_count = 0u32;
-    let mut last_assignment = ChannelAssignment::Independent;
-
     let mut out = Vec::new();
     let mut min_framesize = u32::MAX;
     let mut max_framesize = 0u32;
@@ -664,7 +672,7 @@ fn encode_frames_inner(
             );
         }
 
-        // Per-frame Rice partition-order bounds (`process_subframes_:3163`). The
+        // Per-frame Rice partition-order bounds (`process_subframes_:3747`). The
         // C clamps min to max (`flac_min`); min is 0 so that is a no-op, and
         // `find_best_partition_order` re-clamps min against the limited max.
         let max_partition_order = rice::max_partition_order_from_blocksize(bs as u32)
@@ -725,7 +733,7 @@ fn encode_frames_inner(
                 .map(|i| interleaved[(start + i) * ch + 1] as i64)
                 .collect();
             // Mid/side from the *original* (pre-wasted-shift) L/R
-            // (`process_subframes_:3210`): side = L - R, mid = (L + R) >> 1. The i64
+            // (`process_subframes_:3814`): side = L - R, mid = (L + R) >> 1. The i64
             // arithmetic is exact for the 33-bit side / 32-bit mid of 32-bit input
             // and matches the i32 path for ≤24-bit.
             let mid_side = || {
@@ -734,11 +742,11 @@ fn encode_frames_inner(
                 (mid, side)
             };
 
-            // Between loose decision points, reuse the last assignment and encode
-            // only the channels it needs.
+            // Loose mid-side decides per frame before any subframe is evaluated
+            // and encodes only the channels it needs.
             let (assignment, pair): (ChannelAssignment, [ChosenChannel; 2]) =
-                if config.loose_mid_side && loose_count != 0 {
-                    if last_assignment == ChannelAssignment::Independent {
+                if config.loose_mid_side {
+                    if loose_prefers_independent(&left, &right) {
                         (
                             ChannelAssignment::Independent,
                             [choose(left, 0), choose(right, 0)],
@@ -756,17 +764,15 @@ fn encode_frames_inner(
                     let cr = choose(right, 0);
                     let cm = choose(mid, 0);
                     let cs = choose(side, 1);
-                    // Smallest total wins, independent preferred on ties. Loose
-                    // decision frames consider only independent vs mid-side.
+                    // Smallest total wins, independent preferred on ties.
                     let mut assignment = ChannelAssignment::Independent;
                     let mut min_bits = cl.bits + cr.bits;
-                    let all = !config.loose_mid_side;
-                    for (enabled, bits, ca) in [
-                        (all, cl.bits + cs.bits, ChannelAssignment::LeftSide),
-                        (all, cr.bits + cs.bits, ChannelAssignment::RightSide),
-                        (true, cm.bits + cs.bits, ChannelAssignment::MidSide),
+                    for (bits, ca) in [
+                        (cl.bits + cs.bits, ChannelAssignment::LeftSide),
+                        (cr.bits + cs.bits, ChannelAssignment::RightSide),
+                        (cm.bits + cs.bits, ChannelAssignment::MidSide),
                     ] {
-                        if enabled && bits < min_bits {
+                        if bits < min_bits {
                             min_bits = bits;
                             assignment = ca;
                         }
@@ -799,14 +805,6 @@ fn encode_frames_inner(
                     cc.subframe_bps,
                     cc.wasted_bits,
                 );
-            }
-
-            last_assignment = assignment;
-            if config.loose_mid_side {
-                loose_count += 1;
-                if loose_count >= loose_frames {
-                    loose_count = 0;
-                }
             }
         } else {
             write_frame_header(
@@ -848,13 +846,18 @@ fn encode_frames_inner(
         frame_number += 1;
     }
     // With no frames, libFLAC finishes with the "absurdly-high" initial value it
-    // sets once STREAMINFO is first written (`stream_encoder.c:1224`).
+    // sets once STREAMINFO is first written (`stream_encoder.c:1382`).
     if min_framesize == u32::MAX {
         min_framesize = (1 << 24) - 1;
     }
-    // Finish: sort + uniquify the filled seektable, padding the tail with
-    // placeholders (`stream_encoder.c:2918`).
+    // Finish (`stream_encoder.c:3239`): turn targets past the end of the stream
+    // into placeholders, then sort + uniquify, padding the tail with placeholders.
     if let Some(points) = seektable {
+        for p in points.iter_mut() {
+            if p.sample_number > total as u64 {
+                p.sample_number = metadata::SEEKPOINT_PLACEHOLDER;
+            }
+        }
         metadata::seektable_sort(points);
     }
     (out, min_framesize, max_framesize)
@@ -1122,7 +1125,7 @@ impl EncoderConfig {
     }
 }
 
-/// A one-shot FLAC encoder, byte-identical to libFLAC 1.4.3 at the same settings.
+/// A one-shot FLAC encoder, byte-identical to libFLAC 1.5.0 at the same settings.
 ///
 /// Each `encode*` method takes the **entire** interleaved signal (channel-major
 /// within a sample — `L R L R …` for stereo, each value a sign-extended `i32`) and

@@ -1,4 +1,4 @@
-//! The C reference encoder — libFLAC 1.4.3 with libogg 1.3.5 — behind the same
+//! The C reference encoder — libFLAC 1.5.0 with libogg 1.3.5 — behind the same
 //! settings types as `libflac-rs`, for differential tests.
 //!
 //! Each function encodes with libFLAC configured from a [`libflac_rs::EncoderConfig`]

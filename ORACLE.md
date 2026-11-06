@@ -1,6 +1,6 @@
 # Differential testing against the C oracle
 
-This crate is a **bit-exact** port of libFLAC 1.4.3: its output is byte-identical to
+This crate is a **bit-exact** port of libFLAC 1.5.0: its output is byte-identical to
 the C reference. That is checked by a **differential test crate**, `oracle/`, which
 compiles the real libFLAC (and libogg, for Ogg FLAC) from source and compares the
 Rust output against the C output byte-for-byte.
@@ -15,7 +15,7 @@ from the package) that depends on `libflac-rs` by path. Only it uses `cc`.
 
 | Component | Upstream | Version / tag | Role |
 | --- | --- | --- | --- |
-| libFLAC | [xiph/flac](https://github.com/xiph/flac) | `1.4.3` | the encoder reference (scalar path only) |
+| libFLAC | [xiph/flac](https://github.com/xiph/flac) | `1.5.0` | the encoder reference (scalar path only) |
 | libogg | [xiph/ogg](https://github.com/xiph/ogg) | `v1.3.5` | Ogg page framing (libFLAC delegates all Ogg paging to it) |
 
 Both are BSD-3-Clause (Xiph.Org). The sources are **not vendored**:
@@ -25,7 +25,7 @@ Both are BSD-3-Clause (Xiph.Org). The sources are **not vendored**:
 ## 2. Running it
 
 ```sh
-oracle/fetch-sources.sh      # once; clones libFLAC 1.4.3 + libogg 1.3.5
+oracle/fetch-sources.sh      # once; clones libFLAC 1.5.0 + libogg 1.3.5
 cd oracle && cargo test
 ```
 
@@ -52,7 +52,7 @@ Rust port keeps separate (they would on arm64).
 | File | Role |
 | --- | --- |
 | `fetch-sources.sh` | clones the Xiph tags into `vendor/` |
-| `build.rs` | compiles libFLAC (`stream_encoder*.c`, `lpc.c`, `fixed.c`, `window.c`, `bitwriter.c`, `bitmath.c`, `crc.c`, `format.c`, `memory.c`, `float.c`, `md5.c`, `cpu.c`, `stream_decoder.c`, `bitreader.c`, the `ogg_*.c` layer), libogg (`framing.c`, `bitwise.c`) and `shim.c`, with MAME's define set (`scripts/src/3rdparty.lua`) plus `FLAC__HAS_OGG=1`. It writes the two headers the upstream builds generate into `OUT_DIR`: libFLAC's `config.h` (MAME's CPU-detection header, `PACKAGE_VERSION "1.4.3"`) and libogg's `ogg/config_types.h`. |
+| `build.rs` | compiles libFLAC (`stream_encoder*.c`, `lpc.c`, `fixed.c`, `window.c`, `bitwriter.c`, `bitmath.c`, `crc.c`, `format.c`, `memory.c`, `float.c`, `md5.c`, `cpu.c`, `stream_decoder.c`, `bitreader.c`, the `ogg_*.c` layer), libogg (`framing.c`, `bitwise.c`) and `shim.c`, with MAME's define set (`scripts/src/3rdparty.lua`) plus `FLAC__HAS_OGG=1` and `HAVE_FSEEKO`. It writes the two headers the upstream builds generate into `OUT_DIR`: libFLAC's `config.h` (MAME's CPU-detection header, `PACKAGE_VERSION "1.5.0"`) and libogg's `ogg/config_types.h`. |
 | `shim.c` | one entry point, `libflac_rs_oracle_encode`: raw frames (metadata dropped, as CHD does), a complete stream (seekable sink, so STREAMINFO is rewritten at finish), or Ogg FLAC; plus an optional list of metadata blocks of every type |
 | `src/lib.rs` | safe wrappers mirroring `Encoder`: `encode_frames`, `encode`, `encode_with_metadata`, `encode_ogg`, taking the same `EncoderConfig` and `MetadataBlock`s |
 | `tests/differential.rs` | the matrix: levels 0–8 × depths 8/12/16/20/24/32 × mono/stereo (frames, streams, Ogg); sample rates 8 kHz–655.35 kHz; block sizes 16–65535 incl. the CHD config; 3–8 channels; inputs of 0–4095 samples; every metadata block type, alone and combined |

@@ -32,13 +32,13 @@ pub fn write_verbatim(bw: &mut BitWriter, signal: &[i64], subframe_bps: u32, was
 }
 
 /// Bit cost of a CONSTANT subframe (`evaluate_constant_subframe_`,
-/// `stream_encoder.c:3870`): header + wasted-bits unary + one sample.
+/// `stream_encoder.c:4466`): header + wasted-bits unary + one sample.
 pub fn constant_bits(subframe_bps: u32, wasted_bits: u32) -> u32 {
     SUBFRAME_HEADER_LEN + wasted_bits + subframe_bps
 }
 
 /// Bit cost of a VERBATIM subframe (`evaluate_verbatim_subframe_`,
-/// `stream_encoder.c:4078`): header + wasted-bits unary + every sample.
+/// `stream_encoder.c:4678`): header + wasted-bits unary + every sample.
 pub fn verbatim_bits(blocksize: u32, subframe_bps: u32, wasted_bits: u32) -> u32 {
     SUBFRAME_HEADER_LEN + wasted_bits + blocksize * subframe_bps
 }
@@ -66,7 +66,7 @@ pub fn write_fixed(
 }
 
 /// Bit cost of a FIXED subframe (`evaluate_fixed_subframe_`,
-/// `stream_encoder.c:3940`): header + wasted + `order` warmup + residual estimate.
+/// `stream_encoder.c:4538`): header + wasted + `order` warmup + residual estimate.
 pub fn fixed_bits(order: u32, subframe_bps: u32, wasted_bits: u32, residual_bits: u32) -> u32 {
     let header = SUBFRAME_HEADER_LEN + wasted_bits + order * subframe_bps;
     if residual_bits < u32::MAX - header {
@@ -135,7 +135,7 @@ fn write_entropy_and_residual(
     );
 }
 
-/// Bit cost of an LPC subframe (`evaluate_lpc_subframe_`, `stream_encoder.c:4043`):
+/// Bit cost of an LPC subframe (`evaluate_lpc_subframe_`, `stream_encoder.c:4643`):
 /// header + wasted + the precision/shift fields + `order*(precision+bps)` (warmup
 /// + coeffs) + residual estimate.
 pub fn lpc_bits(

@@ -2,15 +2,15 @@
 name = "libflac-rs"
 # Version scheme (shared with the sibling bit-exact ports, e.g. lzma-sdk-rs,
 # libzstd-bitexact-rs): 0.<flac-digits>.<patch>. The minor encodes the upstream
-# libFLAC release this crate is bit-exact with (1.4.3 -> 143); the patch counts
-# our own fixes against that target (0.143.1, 0.143.2, ...). The leading 0 marks
+# libFLAC release this crate is bit-exact with (1.5.0 -> 150); the patch counts
+# our own fixes against that target (0.150.0, 0.150.1, ...). The leading 0 marks
 # the public API as still unstable. Retargeting a new libFLAC bumps the minor.
-# Keep in sync with the git tag (v0.143.1).
-version = "0.143.1"
+# Keep in sync with the git tag (v0.150.0).
+version = "0.150.0"
 edition = "2024"
 rust-version = "1.85"
 license = "BSD-3-Clause"
-description = "Bit-exact pure-Rust port of libFLAC 1.4.3: a complete FLAC encoder and decoder (incl. Ogg FLAC) byte-identical to the C reference."
+description = "Bit-exact pure-Rust port of libFLAC 1.5.0: a complete FLAC encoder and decoder (incl. Ogg FLAC) byte-identical to the C reference."
 repository = "https://github.com/danifunker/libflac-rs"
 documentation = "https://docs.rs/libflac-rs"
 keywords = ["flac", "audio", "lossless", "chd", "encoder"]

@@ -87,7 +87,7 @@ pub fn compute_lp_coefficients(autoc: &[f64], max_order: usize) -> LpCoefficient
 
 /// Expected bits per residual sample for a given error scale
 /// (`FLAC__lpc_compute_expected_bits_per_residual_sample_with_error_scale`,
-/// `lpc.c:1588`). `f64` natural log; negative error returns a large sentinel.
+/// `lpc.c:1591`). `f64` natural log; negative error returns a large sentinel.
 pub fn expected_bits_with_error_scale(lpc_error: f64, error_scale: f64) -> f64 {
     if lpc_error > 0.0 {
         let bps = 0.5 * (error_scale * lpc_error).ln() / std::f64::consts::LN_2;
@@ -101,7 +101,7 @@ pub fn expected_bits_with_error_scale(lpc_error: f64, error_scale: f64) -> f64 {
 }
 
 /// Expected bits per residual sample (`...expected_bits_per_residual_sample`,
-/// `lpc.c:1577`): `error_scale = 0.5 / total_samples`. Used for the per-order
+/// `lpc.c:1580`): `error_scale = 0.5 / total_samples`. Used for the per-order
 /// "don't even try" short-circuit.
 pub fn expected_bits(lpc_error: f64, total_samples: u32) -> f64 {
     let error_scale = 0.5 / total_samples as f64;
@@ -109,7 +109,7 @@ pub fn expected_bits(lpc_error: f64, total_samples: u32) -> f64 {
 }
 
 /// Pick the order in `1..=max_order` minimizing the estimated total subframe bits
-/// (`FLAC__lpc_compute_best_order`, `lpc.c:1605`). `best_bits` starts at
+/// (`FLAC__lpc_compute_best_order`, `lpc.c:1608`). `best_bits` starts at
 /// `(uint32_t)-1` cast to `double`; ties keep the lower order (strict `<`).
 pub fn compute_best_order(
     error: &[f64],

@@ -4,7 +4,7 @@ version = "0.0.0"
 edition = "2024"
 rust-version = "1.85"
 license = "BSD-3-Clause"
-description = "Differential test oracle: the C libFLAC 1.4.3 + libogg 1.3.5 behind libflac-rs's public API."
+description = "Differential test oracle: the C libFLAC 1.5.0 + libogg 1.3.5 behind libflac-rs's public API."
 publish = false
 
 # A workspace of its own, so the library's builds never resolve `cc`.

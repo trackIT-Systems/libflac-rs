@@ -1,5 +1,5 @@
 #!/bin/sh
-# Fetch the C reference sources the oracle compiles: libFLAC 1.4.3 and libogg 1.3.5,
+# Fetch the C reference sources the oracle compiles: libFLAC 1.5.0 and libogg 1.3.5,
 # shallow-cloned from the Xiph release tags into oracle/vendor/ (gitignored). The
 # build script reads them from there, or from LIBFLAC_SRC / LIBOGG_SRC if set.
 set -eu
@@ -16,5 +16,5 @@ fetch() { # <name> <tag> <url>
     echo "$1: $2 -> $dir/$1"
 }
 
-fetch flac 1.4.3 https://github.com/xiph/flac.git
+fetch flac 1.5.0 https://github.com/xiph/flac.git
 fetch ogg v1.3.5 https://github.com/xiph/ogg.git

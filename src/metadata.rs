@@ -1,7 +1,7 @@
 //! FLAC metadata blocks. Only STREAMINFO (the mandatory first block) is written;
 //! the field layout is from `FLAC/format.h` and the metadata framing in
-//! `stream_encoder.c` (`streaminfo` setup at `:1200`, framesize tracking at
-//! `:2703`). All fields are big-endian, MSB-first, and the body is exactly 34
+//! `stream_encoder.c` (`streaminfo` setup at `:1358`, framesize tracking at
+//! `:3019`). All fields are big-endian, MSB-first, and the body is exactly 34
 //! bytes (byte-aligned throughout).
 
 use crate::bitwriter::BitWriter;
@@ -184,7 +184,7 @@ pub fn write_application(bw: &mut BitWriter, id: &[u8; 4], data: &[u8], is_last:
 
 /// Write a SEEKTABLE block: N seek points × 18 bytes
 /// (`stream_encoder_framing.c:122`; the finish-time rewrite at
-/// `stream_encoder.c:2928` produces the same layout). `sample_number` and
+/// `stream_encoder.c:3257` produces the same layout). `sample_number` and
 /// `stream_offset` are 64-bit, `frame_samples` 16-bit, all big-endian. The body
 /// length is `num_points * 18` even after sorting (unused trailing points are
 /// placeholders), matching the header written once at metadata time.
@@ -301,10 +301,10 @@ pub fn write_cuesheet(
     }
 }
 
-/// The vendor string libFLAC 1.4.3 writes into its auto VORBIS_COMMENT
-/// (`FLAC__VENDOR_STRING` = `"reference libFLAC " PACKAGE_VERSION " 20230623"`
+/// The vendor string libFLAC 1.5.0 writes into its auto VORBIS_COMMENT
+/// (`FLAC__VENDOR_STRING` = `"reference libFLAC " PACKAGE_VERSION " 20250211"`, `format.c:58`
 /// with no git tag/hash defined). Used to byte-match libFLAC's default output.
-pub const LIBFLAC_VENDOR_STRING: &str = "reference libFLAC 1.4.3 20230623";
+pub const LIBFLAC_VENDOR_STRING: &str = "reference libFLAC 1.5.0 20250211";
 
 /// Write a metadata block header (1-bit last flag, 7-bit type, 24-bit length).
 fn write_block_header(bw: &mut BitWriter, is_last: bool, block_type: u32, length: u32) {

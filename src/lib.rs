@@ -1,4 +1,4 @@
-//! `libflac-rs` — a pure-Rust, **bit-exact** port of **libFLAC 1.4.3**: a complete
+//! `libflac-rs` — a pure-Rust, **bit-exact** port of **libFLAC 1.5.0**: a complete
 //! FLAC **encoder and decoder** whose output is byte-identical to the C reference.
 //!
 //! It exists for consumers that must *recreate* the exact bytes libFLAC/MAME produce

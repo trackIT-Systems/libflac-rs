@@ -1,4 +1,4 @@
-//! Compiles the C reference — libFLAC 1.4.3 (scalar path) and libogg 1.3.5 — plus
+//! Compiles the C reference — libFLAC 1.5.0 (scalar path) and libogg 1.3.5 — plus
 //! the FFI shim in `shim.c` into one static library the oracle crate links.
 //!
 //! The C sources are not vendored. `fetch-sources.sh` clones the Xiph release tags
@@ -10,8 +10,8 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// libFLAC's `config.h` as MAME ships it (`3rdparty/flac`): CPU detection and the
-/// package version, which feeds `FLAC__VENDOR_STRING` (`format.c:58`).
+/// libFLAC's `config.h`: MAME's CPU detection (`3rdparty/flac`) and the package
+/// version, which feeds `FLAC__VENDOR_STRING` (`format.c:58`).
 const FLAC_CONFIG_H: &str = r#"#if defined(__i386__) || defined(_M_IX86)
 #define FLAC__CPU_IA32
 #endif
@@ -32,7 +32,7 @@ const FLAC_CONFIG_H: &str = r#"#if defined(__i386__) || defined(_M_IX86)
 #define FLAC__HAS_NEONINTRIN 0
 #define FLAC__HAS_A64NEONINTRIN 0
 #endif
-#define PACKAGE_VERSION "1.4.3"
+#define PACKAGE_VERSION "1.5.0"
 "#;
 
 /// libogg's `config_types.h`, which its configure step generates from
@@ -134,6 +134,9 @@ fn main() {
         .define("NDEBUG", None)
         .define("HAVE_LROUND", "1")
         .define("ENABLE_64_BIT_WORDS", "1")
+        // POSIX fseeko/ftello (glibc, macOS); share/compat.h otherwise
+        // redefines them to fseek/ftell, clashing with <stdio.h>. File I/O only.
+        .define("HAVE_FSEEKO", None)
         .define("HAVE_INTTYPES_H", None)
         .define("HAVE_STDBOOL_H", None)
         .define("HAVE_STDINT_H", None)

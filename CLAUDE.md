@@ -4,7 +4,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A pure-Rust, **bit-exact** port of **libFLAC 1.4.3** — ultimately a *complete*
+A pure-Rust, **bit-exact** port of **libFLAC 1.5.0** (originally 1.4.3; see R1
+under Milestones) — ultimately a *complete*
 encoder **and** decoder whose output is byte-identical to the C reference.
 `flacenc` (the existing pure-Rust encoder) is **not** byte-identical to libFLAC;
 that is precisely why this exists: `chd-rs` and others need to *recreate* the exact
@@ -38,7 +39,7 @@ cargo doc --no-deps        # with RUSTDOCFLAGS="-D warnings", as CI does
 
 ```sh
 # Byte-exactness vs the C reference: a separate workspace that compiles libFLAC
-# 1.4.3 + libogg 1.3.5 (CI job `oracle`, ubuntu-latest).
+# 1.5.0 + libogg 1.3.5 (CI job `oracle`, ubuntu-latest).
 oracle/fetch-sources.sh    # once; clones the Xiph tags into oracle/vendor/
 (cd oracle && cargo test)
 ```
@@ -47,7 +48,7 @@ Run the oracle after any change that can move an output byte. See **`ORACLE.md`*
 
 ## Source of truth: the C libFLAC oracle
 
-The differential oracle is **libFLAC 1.4.3** (Xiph.Org, BSD-3-Clause), compiled by
+The differential oracle is **libFLAC 1.5.0** (Xiph.Org, BSD-3-Clause), compiled by
 the `oracle/` crate from sources fetched into `oracle/vendor/` (not committed). Its
 `build.rs` compiles the scalar reference path; `shim.c` drives the encoder for raw
 frames (write-callback `samples > 0`, discarding the stream marker + metadata exactly
@@ -85,7 +86,7 @@ libFLAC and libogg (see LICENSE).
 `set_sample_rate(44100)`, `set_total_samples_estimate(0)`,
 `set_streamable_subset(false)`, `set_blocksize(block_size)` (typically **2048**).
 
-Level-8 preset (`stream_encoder.c:132`, last row): `do_mid_side=true`,
+Level-8 preset (`stream_encoder.c:140`, last row): `do_mid_side=true`,
 `loose_mid_side=false`, `max_lpc_order=12`, `qlp_coeff_precision=0` (auto),
 `do_qlp_coeff_prec_search=false`, `do_escape_coding=false`,
 `do_exhaustive_model_search=false`, `min_residual_partition_order=0`,
@@ -104,7 +105,7 @@ two). **But MAME compiles libFLAC without `FLAC__USE_AVX`** (verified:
 So the FMA/AVX2 autocorrelation is **compiled out** of chdman.
 
 At level 8 (`max_lpc_order = 12`, so `lag = 13`) the dispatch
-(`stream_encoder.c:1018-1028`) therefore selects **`..._intrin_sse2_lag_14`**,
+(`stream_encoder.c:1034-1044`) therefore selects **`..._intrin_sse2_lag_14`**,
 which is plain `double`, no fused multiply. The scalar function itself
 (`lpc.c:133`) uses the same `deduplication/lpc_compute_autocorrelation_intrin.c`
 template (`autoc[j] += (double)data[i]*(double)data[i-j]`, MAX_LAG 8/12/16) for
@@ -136,10 +137,13 @@ libFLAC two ways (scalar `-DFLAC__NO_ASM` vs MAME's full define set + the
    half-away semantics + cast), verified against the oracle.
 5. **Auto qlp precision** (`lpc.c`): `min(15, 32 - subframe_bps - ilog2(order))`;
    subframe_bps is 17 after mid-side. Get `ilog2` and bps right.
-6. **Rice partition search** (`stream_encoder.c:~4089`): integer, but tie-breaks
+6. **Rice partition search** (`stream_encoder.c:~4689`): integer, but tie-breaks
    (first-best wins) must match. `do_escape_coding` is false at level 8.
-7. **Mid-side decision** (`stream_encoder.c:~3265`, `loose_mid_side=false`):
+7. **Mid-side decision** (`stream_encoder.c:~3925`, `loose_mid_side=false`):
    per-frame L/R vs M/S vs L/S vs R/S by estimated bits — replicate the estimate.
+   With `loose_mid_side` (levels 1, 4) 1.5.0 instead picks L/R or M/S *before*
+   evaluating subframes, by summed absolute first differences
+   (`stream_encoder.c:3766-3794`, ties → M/S).
 8. **`f32` (`FLAC__real`) vs `f64`**: libFLAC stores LPC coeffs as `float` but
    computes autocorrelation in `double`. Match each variable's type precisely.
 
@@ -208,7 +212,7 @@ residual/rice → CRC-16 — diffing at the first mismatching field.
   (`encoder.rs`); `preset(0..=8)` reproduces `compression_levels_[]`. Adds the
   `tukey(p)` apodization (single full window) alongside `subdivide_tukey(parts)`,
   the per-level LPC-order / max-partition-order caps, and `loose_mid_side` (the
-  every-~0.4 s redecision used by levels 1 & 4). Byte-exact vs the oracle for all
+  every-~0.4 s redecision used by levels 1 & 4 in 1.4.3; replaced in R1). Byte-exact vs the oracle for all
   levels 0–8 at 16-bit (stereo + mono), incl. the loose redecision boundary. The
   shim gained `libflac_rs_cref_encode_cfg` (a `compression_level` knob).
 - **G2 — DONE (metadata + MD5, full streams).** `md5.rs` (RFC 1321 + the
@@ -237,11 +241,12 @@ residual/rice → CRC-16 — diffing at the first mismatching field.
   limit. **32-bit** carries the channel signal as `i64` throughout (so the 33-bit
   `side = L-R` and `mid = (L+R)>>1` don't overflow); the fixed/LPC residuals are
   computed wide and either wrap to `i32` (fixed) or bail (LPC `_limit_residual`).
-  Five libFLAC quirks were matched: constant detection is **off at `subframe_bps
-  >= 28`** (the `_limit_residual` predictor reports `rbps[1]=34.0`, so a constant
-  32-bit signal is FIXED not CONSTANT); `get_wasted_bits_wide_` returns **shift 1**
+  Five libFLAC quirks were matched: constant detection at **`subframe_bps >= 28`**
+  goes through the `_limit_residual` predictor's `rbps[1]`, which stays `34.0` for
+  an **all-zero** signal (so that one is FIXED, not CONSTANT — in 1.4.3 every
+  constant 32-bit signal was); `get_wasted_bits_wide_` returns **shift 1**
   for an all-zero side; the **fixed subframe is skipped when `rbps >= subframe_bps`**
-  (`stream_encoder.c:3561`); and rice selection **short-circuits on `mean < 2`**.
+  (`stream_encoder.c:4154`); and rice selection **short-circuits on `mean < 2`**.
   Frames + full streams byte-exact for all depths.
 - **D1 — decoder core DONE.** `bitreader.rs` (MSB-first reads, the decode mirror of
   `bitwriter`) + `decoder.rs`: `decode_frames` (raw frames) and `decode` (full
@@ -262,6 +267,17 @@ residual/rice → CRC-16 — diffing at the first mismatching field.
   header-packet count is `0` (unknown) and the SEEKTABLE is dropped for Ogg. The
   oracle is built `FLAC__HAS_OGG=1` with the `ogg_*.c` layer + vendored libogg
   (`cref/vendor/ogg`); still zero **runtime** deps.
+- **R1 — DONE (retarget to libFLAC 1.5.0, `0.150.0`).** The output-relevant
+  1.4.3 → 1.5.0 changes, found by diffing every compiled `.c` file: the loose
+  mid-side heuristic (`encoder::loose_prefers_independent`); the
+  `CHECK_ORDER_IS_VALID` fix in `fixed.c:356` (each order's estimate from its own
+  error sum, which makes constant non-zero ≥28-bit subframes CONSTANT); seektable
+  targets past the end become placeholders (`stream_encoder.c:3239`); the vendor
+  string. The new `FLAC__lpc_max_residual_bps` bound (`lpc.c:962`) is ported too
+  but cannot change output (where it avoids the `_limit_residual` path, the residual
+  provably fits). Multithreading, bitwriter growth and the Ogg write-callback sample
+  counts don't affect bytes. The CHD configuration is unaffected: its output is
+  identical under 1.4.3 and 1.5.0 (checked against both oracles).
 
 ## Conventions
 
@@ -271,4 +287,4 @@ residual/rice → CRC-16 — diffing at the first mismatching field.
 - Library is `#![forbid(unsafe_code)]`, edition 2024, MSRV 1.85, **zero
   dependencies** (pure `std`, not even a build script) — keep it that way. C and
   `cc` live only in the separate `oracle/` workspace; see `ORACLE.md`.
-- Version scheme `0.<flac-digits>.<patch>` (1.4.3 → `0.143.x`); git tag `v0.143.1`.
+- Version scheme `0.<flac-digits>.<patch>` (1.5.0 → `0.150.x`); git tag `v0.150.0`.

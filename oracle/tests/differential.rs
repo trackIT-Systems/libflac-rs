@@ -1,4 +1,4 @@
-//! Byte-for-byte comparison of `libflac-rs` against the C libFLAC 1.4.3 + libogg
+//! Byte-for-byte comparison of `libflac-rs` against the C libFLAC 1.5.0 + libogg
 //! 1.3.5, through the public API only: raw frames, complete streams and Ogg FLAC
 //! across compression levels, bit depths, channel counts, sample rates, block
 //! sizes and every metadata block type.
@@ -428,6 +428,71 @@ fn metadata_blocks() {
                     );
                 }
             }
+        }
+    }
+    failures.assert_none();
+}
+
+/// Constant signals at 28–33-bit subframes, which libFLAC 1.5.0 codes as CONSTANT
+/// (1.4.3: FIXED) unless the value is 0: an odd value leaves no wasted bits, a
+/// multiple of 8 leaves 29 bits, and constant L/R give a constant 33-bit side.
+#[test]
+fn constant_wide_subframes() {
+    let mut failures = Failures::default();
+    let n = 4096 * 2 + 777;
+    let values = [1, -1, 3 << 3, i32::MAX, i32::MIN + 1, 0x1234_5677, 0];
+    for level in [0, 1, 4, 5, 8] {
+        for &c in &values {
+            let cfg = EncoderConfig::new(1, 32, 48_000).with_compression_level(level);
+            let pcm = vec![c; n];
+            failures.check(
+                format_args!("mono 32-bit constant {c} level {level}"),
+                &Encoder::new(cfg).encode(&pcm),
+                &oracle::encode(&cfg, &pcm),
+            );
+        }
+        for (l, r) in [(i32::MAX, i32::MIN), (7, -8), (i32::MIN + 1, 1), (5, 5)] {
+            let cfg = EncoderConfig::new(2, 32, 48_000).with_compression_level(level);
+            let pcm: Vec<i32> = (0..n).flat_map(|_| [l, r]).collect();
+            failures.check(
+                format_args!("stereo 32-bit constant ({l}, {r}) level {level}"),
+                &Encoder::new(cfg).encode(&pcm),
+                &oracle::encode(&cfg, &pcm),
+            );
+        }
+    }
+    failures.assert_none();
+}
+
+/// SEEKTABLE templates with targets at and past the end of the stream: libFLAC
+/// 1.5.0 turns targets beyond the last sample into placeholders.
+#[test]
+fn seektable_targets_past_end() {
+    let mut failures = Failures::default();
+    let pcm = signal(2, 16, 4096, 3, 99);
+    let total = (pcm.len() / 2) as u64;
+    let point = |sample_number| libflac_rs::SeekPoint {
+        sample_number,
+        stream_offset: 0,
+        frame_samples: 0,
+    };
+    let templates = [
+        vec![point(0), point(total - 1), point(total), point(total + 1)],
+        vec![point(5000), point(total + 4096), point(total * 3)],
+        spaced_seek_points(12, total * 2),
+    ];
+    for (i, template) in templates.iter().enumerate() {
+        for level in [0, 8] {
+            let cfg = EncoderConfig::new(2, 16, 44_100).with_compression_level(level);
+            let blocks = [
+                MetadataBlock::VorbisComment(LIBFLAC_VENDOR_STRING),
+                MetadataBlock::Seektable(template),
+            ];
+            failures.check(
+                format_args!("template {i} level {level}"),
+                &Encoder::new(cfg).encode_with_metadata(&pcm, &blocks),
+                &oracle::encode_with_metadata(&cfg, &pcm, &blocks),
+            );
         }
     }
     failures.assert_none();

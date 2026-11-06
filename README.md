@@ -1,6 +1,6 @@
 # libflac-rs
 
-A pure-Rust, **bit-exact** port of [libFLAC](https://xiph.org/flac/) 1.4.3 — a
+A pure-Rust, **bit-exact** port of [libFLAC](https://xiph.org/flac/) 1.5.0 — a
 complete FLAC **encoder and decoder** whose output is **byte-identical** to the C
 reference. Unlike a "produces valid FLAC" library, the goal is to *recreate the
 exact bytes* libFLAC/MAME produce, so tools like `chd-rs` can reproduce and verify
@@ -21,6 +21,21 @@ Rust. See [`ORACLE.md`](ORACLE.md):
   support.
 - ✅ **Ogg FLAC** (encode + decode), byte-identical to libFLAC + libogg.
 - ✅ Pure Rust, `#![forbid(unsafe_code)]`, **zero runtime dependencies**.
+
+### libFLAC 1.5.0 vs. 1.4.3
+
+Since 0.150.0 the target is libFLAC **1.5.0** (0.143.x targeted 1.4.3). The encoder
+output differs from 1.4.3 only where 1.5.0 changed it:
+
+- **Loose mid-side** (compression levels 1 and 4, stereo): a per-frame heuristic on
+  the first differences of L/R vs. M/S replaces the re-decision every ~0.4 s.
+- **Constant signals at 28–33-bit subframes** (32-bit input, non-zero value) are
+  coded as CONSTANT instead of FIXED.
+- **SEEKTABLE templates**: targets past the end of the stream become placeholders.
+- The default **vendor string** is `reference libFLAC 1.5.0 20250211`.
+
+None of these touch MAME/CHD's configuration (level 8, 16-bit stereo, raw frames),
+so CHD audio stays byte-identical to the libFLAC 1.4.3 that MAME ships.
 
 ## Usage
 
@@ -70,7 +85,7 @@ cargo test   # pure-Rust unit + lossless round-trip tests (any platform)
 ```
 
 Byte-exactness against the C reference is checked by the `oracle/` crate, which
-compiles libFLAC 1.4.3 + libogg 1.3.5 and diffs complete outputs (CI runs it under
+compiles libFLAC 1.5.0 + libogg 1.3.5 and diffs complete outputs (CI runs it under
 glibc, the libm parity target MAME/chdman use):
 
 ```sh

@@ -1,6 +1,6 @@
 //! Frame header and footer, ported from `FLAC__frame_add_header`
 //! (`stream_encoder_framing.c:245`) and the footer in `process_frame_`
-//! (`stream_encoder.c:3118`).
+//! (`stream_encoder.c:3453`).
 
 use crate::bitwriter::BitWriter;
 use crate::format::*;
@@ -121,7 +121,7 @@ enum SrHint {
 }
 
 /// Finish a frame: zero-pad to a byte boundary, then append the CRC-16 over the
-/// whole frame (`process_frame_`, `stream_encoder.c:3118`).
+/// whole frame (`process_frame_`, `stream_encoder.c:3453`).
 pub fn write_frame_footer(bw: &mut BitWriter) {
     bw.zero_pad_to_byte_boundary();
     let crc = bw.crc16();

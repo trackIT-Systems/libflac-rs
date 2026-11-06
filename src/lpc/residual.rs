@@ -53,33 +53,28 @@ pub fn compute_residual_limit(
     Some(residual)
 }
 
-/// Max bits in the predictor sum before the shift
-/// (`FLAC__lpc_max_prediction_before_shift_bps`, `lpc.c:942`):
-/// `subframe_bps + silog2(Σ|qlp_coeff|)`.
-pub fn max_prediction_before_shift_bps(subframe_bps: u32, qlp_coeff: &[i32], order: usize) -> u32 {
-    let mut abs_sum = 0i32;
-    for &c in &qlp_coeff[..order] {
-        abs_sum += c.abs();
-    }
-    if abs_sum == 0 {
-        abs_sum = 1;
-    }
-    subframe_bps + silog2(abs_sum as i64)
+/// Largest possible prediction magnitude before the shift
+/// (`FLAC__lpc_max_prediction_value_before_shift`, `lpc.c:942`):
+/// `2^(subframe_bps-1) · Σ|qlp_coeff|`, the coefficient sum in `u32` as in the C.
+fn max_prediction_value_before_shift(subframe_bps: u32, qlp_coeff: &[i32], order: usize) -> u64 {
+    let abs_sum = qlp_coeff[..order]
+        .iter()
+        .fold(0u32, |acc, &c| acc.wrapping_add(c.unsigned_abs()));
+    (1u64 << (subframe_bps - 1)) * u64::from(abs_sum)
 }
 
-/// Max bits in a residual sample (`FLAC__lpc_max_residual_bps`, `lpc.c:958`); when
-/// this exceeds 32 the encoder must use the overflow-checked residual path.
+/// Max bits in a residual sample (`FLAC__lpc_max_residual_bps`, `lpc.c:962`): the
+/// largest sample magnitude plus the largest prediction after the shift, rounded
+/// up (`-((-v) >> shift)`). When this exceeds 32 the encoder must use the
+/// overflow-checked residual path.
 pub fn max_residual_bps(
     subframe_bps: u32,
     qlp_coeff: &[i32],
     order: usize,
     lp_quantization: i32,
 ) -> u32 {
-    let predictor_sum_bps =
-        max_prediction_before_shift_bps(subframe_bps, qlp_coeff, order) as i32 - lp_quantization;
-    if subframe_bps as i32 > predictor_sum_bps {
-        subframe_bps + 1
-    } else {
-        (predictor_sum_bps + 1) as u32
-    }
+    let max_abs_sample_value = 1u64 << (subframe_bps - 1);
+    let prediction = max_prediction_value_before_shift(subframe_bps, qlp_coeff, order) as i64;
+    let after_shift = (-((-prediction) >> lp_quantization)) as u64;
+    silog2((max_abs_sample_value + after_shift) as i64)
 }
