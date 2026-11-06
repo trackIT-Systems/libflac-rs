@@ -600,7 +600,8 @@ pub fn encode_frames(
 }
 
 /// As [`encode_frames`], also returning the min/max frame size in bytes (for
-/// STREAMINFO). `min_framesize` is 0 if no frames were produced. When `seektable`
+/// STREAMINFO). `min_framesize` is `0xFFFFFF` if no frames were produced, as in
+/// libFLAC. When `seektable`
 /// is `Some`, it is a SEEKTABLE *template* (sorted target sample numbers) filled in
 /// place as frames go by, then sorted/uniquified at finish — exactly as libFLAC
 /// generates a seektable during encoding. When `frame_lengths` is `Some`, each
@@ -846,8 +847,10 @@ fn encode_frames_inner(
         start += bs;
         frame_number += 1;
     }
+    // With no frames, libFLAC finishes with the "absurdly-high" initial value it
+    // sets once STREAMINFO is first written (`stream_encoder.c:1224`).
     if min_framesize == u32::MAX {
-        min_framesize = 0;
+        min_framesize = (1 << 24) - 1;
     }
     // Finish: sort + uniquify the filled seektable, padding the tail with
     // placeholders (`stream_encoder.c:2918`).

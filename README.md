@@ -9,10 +9,9 @@ byte-identical to libFLAC — which is precisely why this exists.)
 
 ## Status — complete and byte-exact
 
-Every byte was verified **against the real libFLAC** (and libogg for Ogg), compiled
-from source as a differential oracle. That oracle is no longer vendored — the repo is
-100% pure Rust — but the process to re-establish and re-run it is documented in
-[`ORACLE.md`](ORACLE.md):
+Every byte is verified **against the real libFLAC** (and libogg for Ogg), compiled
+from source by the separate `oracle/` test crate — the library itself is 100% pure
+Rust. See [`ORACLE.md`](ORACLE.md):
 
 - ✅ **Encoder**, byte-identical to libFLAC: compression levels **0–8**, bit depths
   **8/12/16/20/24/32**, mono / stereo (mid-side) / multichannel, the audio MD5, and
@@ -70,9 +69,15 @@ The crate is `#![forbid(unsafe_code)]`, edition 2024, with **no dependencies at 
 cargo test   # pure-Rust unit + lossless round-trip tests (any platform)
 ```
 
-Byte-exactness against the C reference is re-checked **on demand** by restoring the
-differential oracle (vendored libFLAC + libogg, built under glibc/gcc — the libm
-parity target MAME/chdman use). See [`ORACLE.md`](ORACLE.md) for the exact process.
+Byte-exactness against the C reference is checked by the `oracle/` crate, which
+compiles libFLAC 1.4.3 + libogg 1.3.5 and diffs complete outputs (CI runs it under
+glibc, the libm parity target MAME/chdman use):
+
+```sh
+oracle/fetch-sources.sh && (cd oracle && cargo test)
+```
+
+See [`ORACLE.md`](ORACLE.md).
 
 ## License
 

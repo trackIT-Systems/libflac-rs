@@ -1,0 +1,21 @@
+[package]
+name = "libflac-rs-oracle"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.85"
+license = "BSD-3-Clause"
+description = "Differential test oracle: the C libFLAC 1.4.3 + libogg 1.3.5 behind libflac-rs's public API."
+publish = false
+
+# A workspace of its own, so the library's builds never resolve `cc`.
+[workspace]
+
+[dependencies]
+libflac-rs = { path = ".." }
+
+[build-dependencies]
+cc = "1.2"
+
+[profile.dev]
+# The test matrix encodes every level/depth/channel combination twice (Rust and C).
+opt-level = 2

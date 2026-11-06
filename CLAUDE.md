@@ -20,7 +20,7 @@ metadata blocks, MD5, the decoder, and (optionally) Ogg FLAC. See Milestones.
 
 **Success criterion:** for every input in the corpus, `libflac-rs` output equals
 the C libFLAC bytes for the same settings — verified live against the compiled C
-oracle (the `cref` feature), which can be configured for *any* libFLAC settings.
+oracle (the `oracle/` crate), which can be configured for *any* libFLAC settings.
 
 This is bit-exactness-first work: a "working" codec that produces valid FLAC is
 **not** the goal if it differs from the C output by a single byte.
@@ -36,25 +36,25 @@ cargo clippy --all-targets -- -D warnings
 cargo doc --no-deps        # with RUSTDOCFLAGS="-D warnings", as CI does
 ```
 
-**The C differential oracle is no longer in the tree.** Byte-exactness against the C
-reference is re-checked on demand by restoring the oracle — see **`ORACLE.md`** for
-the full process (TL;DR: `git checkout c-oracle -- cref build.rs`, re-add the `cref`
-feature + `cc` build-dep, then run `cargo test --features cref` in WSL/glibc so the C
-and Rust transcendentals resolve to the same libm). When porting/debugging a byte
-divergence, restore the oracle and **read the C** — do not reconstruct logic from
-memory. Set `CARGO_TARGET_DIR` to a native Linux path under WSL on a `/mnt/c`
-checkout to keep builds fast and avoid 9p quirks in `target/`.
+```sh
+# Byte-exactness vs the C reference: a separate workspace that compiles libFLAC
+# 1.4.3 + libogg 1.3.5 (CI job `oracle`, ubuntu-latest).
+oracle/fetch-sources.sh    # once; clones the Xiph tags into oracle/vendor/
+(cd oracle && cargo test)
+```
 
-## Source of truth: the C libFLAC oracle (restored on demand)
+Run the oracle after any change that can move an output byte. See **`ORACLE.md`**.
 
-The differential oracle is **libFLAC 1.4.3** (Xiph.Org, BSD-3-Clause). It is no
-longer vendored in the tree — restore it with `git checkout c-oracle -- cref
-build.rs` (see **`ORACLE.md`**). When restored, `build.rs` compiles the scalar
-reference path under the `cref` feature; `cref/shim.c` drives the encoder and
-captures only the audio frames (write-callback `samples > 0`), discarding the
-stream marker + metadata exactly as CHD does. When porting or debugging a
-divergence, **read the C** — do not reconstruct logic from memory. Module
-doc-comments cite specific `*.c:NNN` lines; keep those citations accurate.
+## Source of truth: the C libFLAC oracle
+
+The differential oracle is **libFLAC 1.4.3** (Xiph.Org, BSD-3-Clause), compiled by
+the `oracle/` crate from sources fetched into `oracle/vendor/` (not committed). Its
+`build.rs` compiles the scalar reference path; `shim.c` drives the encoder for raw
+frames (write-callback `samples > 0`, discarding the stream marker + metadata exactly
+as CHD does), full streams, or Ogg FLAC. When porting or debugging a divergence,
+**read the C** in `oracle/vendor/flac/src/libFLAC` — do not reconstruct logic from
+memory. Module doc-comments cite specific `*.c:NNN` lines; keep those citations
+accurate.
 
 The port ↔ C-file correspondence (scalar reference path only — see the SIMD note
 below):
@@ -145,21 +145,22 @@ libFLAC two ways (scalar `-DFLAC__NO_ASM` vs MAME's full define set + the
 
 ## Differential testing
 
-The rig (removed from the tree; restore per **`ORACLE.md`**): `build.rs` +
-`cref/shim.c` compile libFLAC under the `cref` feature and expose
-`libflac_rs_cref_encode(interleaved, nsamples, channels, bps, sample_rate,
-blocksize, max_lpc_order, do_mid_side, out, out_len)`. `max_lpc_order`/`do_mid_side`
-< 0 keep the level-8 preset; ≥ 0 override them for **staged testing**
-(`max_lpc_order = 0` forces fixed/constant/verbatim-only — used to bring up F1
-before the LPC float path exists). `tests/cref.rs` diffs Rust frame bytes against
-the oracle byte-for-byte. The shim symbols reach the integration-test binary via
-`cargo:rustc-link-arg-tests` whole-archive linkage (build-script `rustc-link-lib`
-does not reliably propagate to integration tests).
+`oracle/` (its own workspace, `publish = false`, excluded from the package) depends
+on `libflac-rs` by path and tests through the **public API only**:
+`oracle::{encode_frames, encode, encode_with_metadata, encode_ogg}` take the same
+`EncoderConfig` / `MetadataBlock`s as `Encoder`, so each test is
+`assert_eq!(Encoder::new(cfg).encode(&pcm), oracle::encode(&cfg, &pcm))`.
+`tests/differential.rs` covers levels 0–8 × depths 8–32 × mono/stereo (frames,
+streams, Ogg), sample rates, block sizes (incl. CHD), 3–8 channels, short and
+empty inputs, and every metadata block type. libFLAC always writes a VORBIS_COMMENT
+with its own vendor string, so matching block lists start with
+`VorbisComment(LIBFLAC_VENDOR_STRING)`.
 
-Corpus: silence (→ CONSTANT), full-scale ±32767, sine sweeps (low → near-Nyquist),
-decorrelated noise (exercises mid-side), real 16-bit CD rips. Compare in stages —
-frame header → subframe header → qlp_coeff integers → residual/rice → CRC-16 —
-diffing at the first mismatching field to localize float drift.
+To localize float drift, the original in-tree rig at the **`c-oracle`** tag also
+wraps the individual stages (window, autocorrelation, Levinson, best order,
+quantization, residual) in C; restore it into a scratch branch per **`ORACLE.md`**
+§4 and compare in stages — frame header → subframe header → qlp_coeff integers →
+residual/rice → CRC-16 — diffing at the first mismatching field.
 
 ## Milestones
 
@@ -268,7 +269,6 @@ diffing at the first mismatching field to localize float drift.
   idiomatic refactors are fine only for plumbing that cannot affect output bytes.
 - Keep `*.c:NNN` citations in module docs accurate when you touch the code.
 - Library is `#![forbid(unsafe_code)]`, edition 2024, MSRV 1.85, **zero
-  dependencies** (pure `std`, not even a build script) — keep it that way. The oracle
-  (and its `cc` build-dep) is restored on demand from the `c-oracle` tag for
-  byte-exact re-checks; see `ORACLE.md`.
+  dependencies** (pure `std`, not even a build script) — keep it that way. C and
+  `cc` live only in the separate `oracle/` workspace; see `ORACLE.md`.
 - Version scheme `0.<flac-digits>.<patch>` (1.4.3 → `0.143.x`); git tag `v0.143.1`.

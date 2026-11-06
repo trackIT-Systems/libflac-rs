@@ -13,7 +13,7 @@ jobs:
   # C toolchain, build script, or dependency involved, so this also guards against
   # platform-specific regressions. The lossless round-trip tests (encode -> decode ->
   # PCM, MD5-verified, all depths/levels) live here; byte-exactness vs the C
-  # reference is re-checked on demand via the documented oracle process (ORACLE.md).
+  # reference is the `oracle` job below.
   test:
     strategy:
       fail-fast: false
@@ -39,3 +39,25 @@ jobs:
       - run: cargo doc --locked --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
+
+  # Byte-exactness against the C reference: the `oracle/` crate compiles libFLAC
+  # 1.4.3 + libogg 1.3.5 (fetched from the Xiph tags) and diffs complete outputs
+  # through the public API. glibc only: it is the project's float-parity reference
+  # (cosf, lround), and another libm on the C side may round differently.
+  oracle:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: oracle
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: oracle
+      - run: ./fetch-sources.sh
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked

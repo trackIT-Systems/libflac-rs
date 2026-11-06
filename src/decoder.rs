@@ -676,6 +676,26 @@ mod tests {
         out
     }
 
+    /// No samples: no frames, and libFLAC's untouched `min_framesize` sentinel
+    /// (0xFFFFFF) in STREAMINFO.
+    #[test]
+    fn empty_stream() {
+        let flac = encode(
+            &[],
+            2,
+            16,
+            44_100,
+            4096,
+            &preset(8),
+            true,
+            &[MetadataBlock::VorbisComment(LIBFLAC_VENDOR_STRING)],
+        );
+        assert_eq!(&flac[12..15], &[0xff, 0xff, 0xff]);
+        let dec = decode(&flac).expect("empty stream decodes");
+        assert!(dec.interleaved.is_empty());
+        assert!(dec.md5_ok);
+    }
+
     #[test]
     fn round_trip_all_depths_levels() {
         let bs = 2048u32;

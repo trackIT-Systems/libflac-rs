@@ -16,9 +16,10 @@ documented, zero-dependency **public API** (`Encoder`/`EncoderConfig` + `decode*
 All that remains is dispatching the crates.io release (a maintainer action).
 
 The C differential oracle that established byte-exactness is **no longer vendored** —
-the repository is now 100% pure Rust (no C, no build script, no dependencies). The
-oracle is restored on demand (`git checkout c-oracle -- cref build.rs`) to re-verify
-byte-exactness; the full process is in **[`ORACLE.md`](ORACLE.md)**.
+the library is 100% pure Rust (no C, no build script, no dependencies). Byte-exactness
+is checked by the separate `oracle/` crate, which fetches and compiles libFLAC +
+libogg and runs in CI; see **[`ORACLE.md`](ORACLE.md)**. (The phase notes below
+describe the original in-tree `cref` rig, preserved at the `c-oracle` tag.)
 
 ```
 DONE   Phase 0  Bitwriter + CRC                      █████████

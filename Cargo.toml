@@ -17,10 +17,10 @@ keywords = ["flac", "audio", "lossless", "chd", "encoder"]
 categories = ["multimedia::audio", "multimedia::encoding"]
 readme = "README.md"
 # The published crate is a pure-Rust, dependency-free library plus its docs (src,
-# README/ROADMAP/ORACLE/LICENSE). Drop only the AI dev guide and the CI config.
-# There is no C, no build script, and no build/runtime dependency to exclude — the
-# byte-exact differential oracle is no longer vendored (see ORACLE.md).
-exclude = ["/.github", "/CLAUDE.md"]
+# README/ROADMAP/ORACLE/LICENSE). Drop the AI dev guide, the CI config and the
+# differential-test crate `oracle/` (its own workspace; the only place C and `cc`
+# appear — see ORACLE.md).
+exclude = ["/.github", "/CLAUDE.md", "/oracle"]
 
 [lib]
 name = "libflac_rs"
