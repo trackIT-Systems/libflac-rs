@@ -1,13 +1,15 @@
-/* oracle/shim.c -- FFI shim over the real libFLAC 1.4.3 encoder for the oracle
- * crate. One entry point encodes interleaved PCM in one of three modes (raw
- * frames, a complete FLAC stream, a complete Ogg FLAC stream) with an optional
- * list of metadata blocks, and returns the bytes in a malloc'd buffer the caller
+/* oracle/shim.c -- FFI shim over the real libFLAC encoder and decoder for the
+ * oracle crate. libflac_rs_oracle_encode encodes interleaved PCM in one of three
+ * modes (raw frames, a complete FLAC stream, a complete Ogg FLAC stream) with an
+ * optional list of metadata blocks; libflac_rs_oracle_decode decodes a native or
+ * (chained) Ogg FLAC stream. Results come back in malloc'd buffers the caller
  * releases with libflac_rs_oracle_free. */
 
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include "FLAC/stream_decoder.h"
 #include "FLAC/stream_encoder.h"
 #include "share/private.h" /* FLAC__stream_encoder_set_do_md5 */
 
@@ -394,3 +396,178 @@ void libflac_rs_oracle_free(uint8_t *buf) { free(buf); }
 
 /* FLAC__VENDOR_STRING of the compiled libFLAC. */
 const char *libflac_rs_oracle_vendor_string(void) { return FLAC__VENDOR_STRING; }
+
+/* ---- Decoder ------------------------------------------------------------- */
+
+typedef struct {
+    uint32_t channels;
+    uint32_t bits_per_sample;
+    uint32_t sample_rate;
+    uint64_t first; /* index of the link's first value in the PCM buffer */
+} oracle_link;
+
+typedef struct {
+    const uint8_t *data;
+    size_t len;
+    size_t pos;
+    int32_t *pcm;
+    size_t pcm_len, pcm_cap;
+    oracle_link *links;
+    size_t num_links, links_cap;
+    int32_t *errors;
+    size_t num_errors, errors_cap;
+    int failed;
+} dec_state;
+
+static int grow(void **buf, size_t *cap, size_t need, size_t elem) {
+    size_t cap2 = *cap ? *cap : 64;
+    void *p;
+    if (need <= *cap) {
+        return 1;
+    }
+    while (cap2 < need) {
+        cap2 *= 2;
+    }
+    p = realloc(*buf, cap2 * elem);
+    if (!p) {
+        return 0;
+    }
+    *buf = p;
+    *cap = cap2;
+    return 1;
+}
+
+static int start_link(dec_state *d, uint32_t channels, uint32_t bps, uint32_t rate) {
+    if (!grow((void **)&d->links, &d->links_cap, d->num_links + 1, sizeof(oracle_link))) {
+        return 0;
+    }
+    d->links[d->num_links].channels = channels;
+    d->links[d->num_links].bits_per_sample = bps;
+    d->links[d->num_links].sample_rate = rate;
+    d->links[d->num_links].first = d->pcm_len;
+    d->num_links++;
+    return 1;
+}
+
+static FLAC__StreamDecoderReadStatus dec_read(const FLAC__StreamDecoder *decoder,
+                                              FLAC__byte buffer[], size_t *bytes,
+                                              void *client_data) {
+    dec_state *d = (dec_state *)client_data;
+    size_t want = *bytes;
+    (void)decoder;
+    if (want > d->len - d->pos) {
+        want = d->len - d->pos;
+    }
+    *bytes = want;
+    if (want == 0) {
+        return FLAC__STREAM_DECODER_READ_STATUS_END_OF_STREAM;
+    }
+    memcpy(buffer, d->data + d->pos, want);
+    d->pos += want;
+    return FLAC__STREAM_DECODER_READ_STATUS_CONTINUE;
+}
+
+static void dec_metadata(const FLAC__StreamDecoder *decoder,
+                         const FLAC__StreamMetadata *metadata, void *client_data) {
+    dec_state *d = (dec_state *)client_data;
+    (void)decoder;
+    /* every stream and every chain link starts with its own STREAMINFO */
+    if (metadata->type == FLAC__METADATA_TYPE_STREAMINFO) {
+        const FLAC__StreamMetadata_StreamInfo *si = &metadata->data.stream_info;
+        if (!start_link(d, si->channels, si->bits_per_sample, si->sample_rate)) {
+            d->failed = 1;
+        }
+    }
+}
+
+static FLAC__StreamDecoderWriteStatus dec_write(const FLAC__StreamDecoder *decoder,
+                                                const FLAC__Frame *frame,
+                                                const FLAC__int32 *const buffer[],
+                                                void *client_data) {
+    dec_state *d = (dec_state *)client_data;
+    uint32_t i, c, channels = frame->header.channels;
+    (void)decoder;
+    /* raw frames without STREAMINFO: the first frame starts the link */
+    if (d->num_links == 0 && !start_link(d, channels, frame->header.bits_per_sample,
+                                   frame->header.sample_rate)) {
+        return FLAC__STREAM_DECODER_WRITE_STATUS_ABORT;
+    }
+    if (!grow((void **)&d->pcm, &d->pcm_cap,
+              d->pcm_len + (size_t)frame->header.blocksize * channels, sizeof(int32_t))) {
+        return FLAC__STREAM_DECODER_WRITE_STATUS_ABORT;
+    }
+    for (i = 0; i < frame->header.blocksize; i++) {
+        for (c = 0; c < channels; c++) {
+            d->pcm[d->pcm_len++] = buffer[c][i];
+        }
+    }
+    return FLAC__STREAM_DECODER_WRITE_STATUS_CONTINUE;
+}
+
+static void dec_error(const FLAC__StreamDecoder *decoder,
+                      FLAC__StreamDecoderErrorStatus status, void *client_data) {
+    dec_state *d = (dec_state *)client_data;
+    (void)decoder;
+    if (!grow((void **)&d->errors, &d->errors_cap, d->num_errors + 1, sizeof(int32_t))) {
+        d->failed = 1;
+        return;
+    }
+    d->errors[d->num_errors++] = (int32_t)status;
+}
+
+/* Decode `data` with libFLAC: native FLAC (or raw frames) when `is_ogg` is 0, Ogg
+ * FLAC otherwise, following chain links when `chained` is set. MD5 checking is
+ * off. Hands back the PCM of all links concatenated, a link table (format and
+ * start index), and the FLAC__StreamDecoderErrorStatus values reported, all
+ * malloc'd. Returns the final FLAC__StreamDecoderState (>= 0), or a negative code:
+ * -1 allocation, -100-init_status. */
+int libflac_rs_oracle_decode(const uint8_t *data, size_t len, uint32_t is_ogg,
+                             uint32_t chained, int32_t **pcm, size_t *pcm_len,
+                             oracle_link **links, size_t *num_links, int32_t **errors,
+                             size_t *num_errors) {
+    dec_state d;
+    FLAC__StreamDecoder *dec;
+    FLAC__StreamDecoderInitStatus init;
+    int rc;
+
+    memset(&d, 0, sizeof(d));
+    d.data = data;
+    d.len = len;
+
+    dec = FLAC__stream_decoder_new();
+    if (!dec) {
+        return -1;
+    }
+    FLAC__stream_decoder_set_md5_checking(dec, false);
+    if (is_ogg) {
+        FLAC__stream_decoder_set_decode_chained_stream(dec, chained != 0);
+        init = FLAC__stream_decoder_init_ogg_stream(dec, dec_read, NULL, NULL, NULL, NULL,
+                                                    dec_write, dec_metadata, dec_error, &d);
+    } else {
+        init = FLAC__stream_decoder_init_stream(dec, dec_read, NULL, NULL, NULL, NULL,
+                                                dec_write, dec_metadata, dec_error, &d);
+    }
+    if (init != FLAC__STREAM_DECODER_INIT_STATUS_OK) {
+        FLAC__stream_decoder_delete(dec);
+        return -100 - (int)init;
+    }
+    /* With chaining on, this also crosses links (it calls finish_link itself). */
+    FLAC__stream_decoder_process_until_end_of_stream(dec);
+    rc = (int)FLAC__stream_decoder_get_state(dec);
+    FLAC__stream_decoder_finish(dec);
+    FLAC__stream_decoder_delete(dec);
+
+    if (d.failed) {
+        free(d.pcm);
+        free(d.links);
+        free(d.errors);
+        return -1;
+    }
+    *pcm = d.pcm;
+    *pcm_len = d.pcm_len;
+    *links = d.links;
+    *num_links = d.num_links;
+    *errors = d.errors;
+    *num_errors = d.num_errors;
+    return rc;
+}

@@ -7,9 +7,9 @@
 //! Encode ([`OggStream`]): packets are buffered and emitted as pages by
 //! `flush`/`pageout` exactly as `ogg_stream_flush`/`ogg_stream_pageout` do —
 //! including the "nominal page ≈ 4096 bytes and ≥ 4 packets, else 255 segments"
-//! rule. Decode ([`read_packets`]): pages are CRC-checked and reassembled into
-//! packets by lacing values (a `< 255` segment ends a packet; `255` continues it,
-//! across pages).
+//! rule. Decode ([`read_flac_streams`]): pages are CRC-checked and reassembled
+//! into packets by lacing values (a `< 255` segment ends a packet; `255` continues
+//! it, across pages), per FLAC logical stream.
 
 /// The Ogg CRC-32 lookup table: polynomial `0x04c11db7`, **unreflected**, init/final
 /// `0` (`framing.c` `crc_lookup[0]`).
@@ -235,18 +235,31 @@ impl OggStream {
     }
 }
 
-/// Decode Ogg pages back into their constituent packets (`framing.c` decode side),
-/// CRC-checking every page. Packets are reassembled across segments/pages by lacing
-/// values. Returns `None` on a missing `OggS` sync, a truncated page, or a CRC
-/// mismatch. A trailing unterminated packet (malformed stream) is dropped.
-pub fn read_packets(data: &[u8]) -> Option<Vec<Vec<u8>>> {
-    let mut packets = Vec::new();
-    let mut cur: Vec<u8> = Vec::new();
+/// The packets of the FLAC logical streams in `data`, one list per stream, in the
+/// order their BOS pages appear (`framing.c` decode side plus the stream selection
+/// of libFLAC's `ogg_decoder_aspect.c`). A logical stream is FLAC when its first
+/// packet carries the `0x7F"FLAC"` mapping header; pages of other streams are
+/// skipped. A stream ends at its EOS page, after which its serial number may start
+/// a new stream (a chain link). Reading stops once `max_streams` streams have
+/// ended, so later pages are not examined. Packets are reassembled across
+/// segments/pages by lacing values (a `< 255` segment ends a packet). `None` on a
+/// missing `OggS` sync, a truncated page, or a page CRC mismatch.
+pub fn read_flac_streams(data: &[u8], max_streams: usize) -> Option<Vec<Vec<Vec<u8>>>> {
+    struct Active {
+        serial: u32,
+        stream: usize,
+        partial: Vec<u8>,
+    }
+    let mut streams: Vec<Vec<Vec<u8>>> = Vec::new();
+    let mut active: Vec<Active> = Vec::new();
+    let mut ended = 0usize;
     let mut pos = 0usize;
-    while pos < data.len() {
+    while pos < data.len() && ended < max_streams {
         if pos + 27 > data.len() || &data[pos..pos + 4] != b"OggS" {
             return None;
         }
+        let flags = data[pos + 5];
+        let serial = u32::from_le_bytes(data[pos + 14..pos + 18].try_into().ok()?);
         let nsegs = data[pos + 26] as usize;
         let seg_table = pos + 27;
         let body_start = seg_table + nsegs;
@@ -263,32 +276,46 @@ pub fn read_packets(data: &[u8]) -> Option<Vec<Vec<u8>>> {
         }
 
         // Verify the page CRC over the header (CRC field zeroed) + body.
-        let stored = u32::from_le_bytes([
-            data[pos + 22],
-            data[pos + 23],
-            data[pos + 24],
-            data[pos + 25],
-        ]);
+        let stored = u32::from_le_bytes(data[pos + 22..pos + 26].try_into().ok()?);
         let mut header = data[pos..body_start].to_vec();
-        header[22] = 0;
-        header[23] = 0;
-        header[24] = 0;
-        header[25] = 0;
+        header[22..26].fill(0);
         if crc_update(crc_update(0, &header), &data[body_start..body_end]) != stored {
             return None;
         }
 
-        // Reassemble packets from this page's segments.
-        let mut boff = body_start;
-        for i in 0..nsegs {
-            let lv = data[seg_table + i] as usize;
-            cur.extend_from_slice(&data[boff..boff + lv]);
-            boff += lv;
-            if lv < 255 {
-                packets.push(std::mem::take(&mut cur));
+        // A BOS page whose body starts with the FLAC mapping header opens a stream.
+        let body = &data[body_start..body_end];
+        if flags & 0x02 != 0
+            && body.len() >= 5
+            && body[0] == 0x7F
+            && &body[1..5] == b"FLAC"
+            && !active.iter().any(|a| a.serial == serial)
+        {
+            active.push(Active {
+                serial,
+                stream: streams.len(),
+                partial: Vec::new(),
+            });
+            streams.push(Vec::new());
+        }
+
+        if let Some(i) = active.iter().position(|a| a.serial == serial) {
+            let a = &mut active[i];
+            let mut boff = body_start;
+            for &lv in &data[seg_table..body_start] {
+                let lv = lv as usize;
+                a.partial.extend_from_slice(&data[boff..boff + lv]);
+                boff += lv;
+                if lv < 255 {
+                    streams[a.stream].push(std::mem::take(&mut a.partial));
+                }
+            }
+            if flags & 0x04 != 0 {
+                active.remove(i);
+                ended += 1;
             }
         }
         pos = body_end;
     }
-    Some(packets)
+    Some(streams)
 }

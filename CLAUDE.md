@@ -260,6 +260,14 @@ residual/rice → CRC-16 — diffing at the first mismatching field.
   libFLAC output** (`decode_libflac_streams`). Phase 9 then added **SEEKTABLE-driven
   `seek()`** (`decode_seek`) and **variable-block-size** decoding (`read_utf8_u64`,
   selected by the blocking-strategy bit). Remaining: a streaming/push API (Phase 11).
+  **D2 (libFLAC 1.5.0 decoder, issue #2):** frames are placed by their header
+  numbers (`Timeline::place`, `read_frame_header_`'s fixed-block-size logic) and
+  missing frames are filled with silence under libFLAC's rules (`Timeline::fill_gap`,
+  `stream_decoder.c:2483`, reported as `Gap`s); out-of-range samples reject the
+  frame (`OUT_OF_BOUNDS`, `:2455`); `decode_ogg` takes the first FLAC logical
+  stream and `decode_ogg_chained` every link (`ogg::read_flac_streams`). Checked
+  against libFLAC's decoder in `oracle/tests/decoder.rs`. Corrupt frames still fail
+  the decode (libFLAC resynchronizes).
 - **O1 — Ogg FLAC DONE (byte-exact).** `ogg.rs` ports libogg 1.3.5 paging
   (`framing.c`) + the FLAC-in-Ogg mapping (`ogg_encoder_aspect.c`).
   `encoder::encode_ogg` is **byte-identical to libFLAC+libogg** and

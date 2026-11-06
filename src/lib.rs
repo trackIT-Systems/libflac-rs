@@ -12,8 +12,9 @@
 //!   depths (8/12/16/20/24/32), mono / stereo (with mid-side decorrelation) /
 //!   multichannel, every metadata block (STREAMINFO, VORBIS_COMMENT, PADDING,
 //!   APPLICATION, SEEKTABLE, PICTURE, CUESHEET), and the audio MD5.
-//! - **Decoder**: lossless and MD5-verified, with [`decode_seek`] and
-//!   variable-block-size support.
+//! - **Decoder**: lossless and MD5-verified, with [`decode_seek`], variable block
+//!   sizes, chained Ogg ([`decode_ogg_chained`]), and missing frames filled with
+//!   silence as libFLAC 1.5.0 does ([`Gap`]).
 //! - **Ogg FLAC** ([`Encoder::encode_ogg`] / [`decode_ogg`]), byte-identical to
 //!   libFLAC + libogg.
 //! - Pure Rust, `#![forbid(unsafe_code)]`, **zero runtime dependencies**.
@@ -65,8 +66,8 @@ mod subframe;
 mod window;
 
 pub use decoder::{
-    DecodedFrames, DecodedStream, DecodedVorbisComment, SeekResult, decode, decode_frames,
-    decode_ogg, decode_seek,
+    DecodedFrames, DecodedStream, DecodedVorbisComment, Gap, SeekResult, decode, decode_frames,
+    decode_ogg, decode_ogg_chained, decode_seek,
 };
 pub use encoder::{Encoder, EncoderConfig};
 pub use metadata::{

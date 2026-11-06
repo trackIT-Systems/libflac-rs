@@ -13,6 +13,23 @@ use crate::crc::{crc8, crc16};
 use crate::frame::ChannelAssignment;
 use crate::metadata::{SEEKPOINT_PLACEHOLDER, SeekPoint};
 
+/// Samples missing between two frames: the next frame starts later than the
+/// previous one ended (`ERROR_STATUS_MISSING_FRAME`, `stream_decoder.c:2483`). As
+/// libFLAC 1.5.0 does, the decoder fills the gap with silence if both frames have
+/// the same sample rate, channel count and bit depth and the earlier frame holds
+/// at least 16 samples, but at most 5 seconds and 50 of the earlier frame's
+/// blocks. No gap is detected before the first frame or after the last one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Gap {
+    /// Sample number at which the missing samples begin.
+    pub first_sample: u64,
+    /// Number of missing samples (per channel).
+    pub samples: u64,
+    /// Number of those filled with silence (per channel); the output is that much
+    /// longer.
+    pub filled: u64,
+}
+
 /// Decoded audio frames.
 pub struct DecodedFrames {
     /// Interleaved PCM (channel-major within each sample).
@@ -20,40 +37,38 @@ pub struct DecodedFrames {
     pub channels: u32,
     pub bits_per_sample: u32,
     pub sample_rate: u32,
+    /// Missing frames, in stream order (see [`Gap`]).
+    pub gaps: Vec<Gap>,
 }
 
 /// Decode every audio frame in `data` (the raw frame stream produced by
 /// [`Encoder::encode_frames`](crate::Encoder::encode_frames), i.e. no metadata) back
-/// to interleaved PCM. Returns `None` on any malformed/truncated input or CRC
-/// mismatch.
+/// to interleaved PCM. Missing frames are reported and filled as described at
+/// [`Gap`]. Returns `None` on any malformed/truncated input, a CRC mismatch, or a
+/// frame whose samples exceed its bit depth.
 pub fn decode_frames(data: &[u8]) -> Option<DecodedFrames> {
-    let mut br = BitReader::new(data);
+    let mut timeline = Timeline::new(None);
     let mut interleaved = Vec::new();
-    let mut channels = 0u32;
-    let mut bits_per_sample = 0u32;
-    let mut sample_rate = 0u32;
-
+    let mut br = BitReader::new(data);
+    let mut format = (0, 0, 0);
     while br.byte_pos() < data.len() {
         let frame = decode_frame(&mut br, data)?;
-        channels = frame.channels;
-        bits_per_sample = frame.bits_per_sample;
-        sample_rate = frame.sample_rate;
-        for i in 0..frame.blocksize {
-            for ch in &frame.samples {
-                interleaved.push(ch[i]);
-            }
-        }
+        format = (frame.channels, frame.bits_per_sample, frame.sample_rate);
+        let start = timeline.place(&frame);
+        timeline.fill_gap(start, &frame, &mut interleaved);
+        push_samples(&frame, 0, &mut interleaved);
     }
-
     Some(DecodedFrames {
         interleaved,
-        channels,
-        bits_per_sample,
-        sample_rate,
+        channels: format.0,
+        bits_per_sample: format.1,
+        sample_rate: format.2,
+        gaps: timeline.gaps,
     })
 }
 
-/// A fully decoded FLAC stream (`fLaC` marker + metadata + frames).
+/// A fully decoded FLAC stream (`fLaC` marker + metadata + frames), or one link of
+/// an Ogg FLAC stream.
 pub struct DecodedStream {
     pub interleaved: Vec<i32>,
     pub channels: u32,
@@ -70,6 +85,9 @@ pub struct DecodedStream {
     pub seek_points: Vec<SeekPoint>,
     /// The VORBIS_COMMENT block, if any.
     pub vorbis_comment: Option<DecodedVorbisComment>,
+    /// Missing frames, in stream order (see [`Gap`]). Filled gaps make the audio
+    /// differ from what was encoded, so `md5_ok` is then `false`.
+    pub gaps: Vec<Gap>,
 }
 
 /// A decoded VORBIS_COMMENT block: the vendor string and the user comments
@@ -105,49 +123,177 @@ fn parse_vorbis_comment(body: &[u8]) -> Option<DecodedVorbisComment> {
     Some(DecodedVorbisComment { vendor, comments })
 }
 
-/// Decode a complete FLAC stream: the `fLaC` marker, the metadata blocks (only
-/// STREAMINFO is interpreted; the rest are skipped), then the audio frames.
-/// Verifies the audio MD5 against STREAMINFO when present. `None` on malformed
-/// input or any CRC mismatch.
+/// Decode a complete FLAC stream: the `fLaC` marker, the metadata blocks
+/// (STREAMINFO, SEEKTABLE and VORBIS_COMMENT are interpreted, the rest skipped),
+/// then the audio frames. Verifies the audio MD5 against STREAMINFO when present.
+/// Missing frames are reported and filled as described at [`Gap`]. `None` on
+/// malformed input, a CRC mismatch, or a frame whose samples exceed its bit depth.
 pub fn decode(data: &[u8]) -> Option<DecodedStream> {
     let mut br = BitReader::new(data);
     let (info, seek_points, vorbis_comment) = parse_header(&mut br)?;
-
-    let mut interleaved = Vec::new();
-    while br.byte_pos() < data.len() {
-        let frame = decode_frame(&mut br, data)?;
-        for i in 0..frame.blocksize {
-            for ch in &frame.samples {
-                interleaved.push(ch[i]);
-            }
-        }
-    }
-    // Trim any encoder padding beyond the declared length.
-    if info.total_samples > 0 {
-        interleaved.truncate(info.total_samples as usize * info.channels as usize);
-    }
-
-    let md5_ok = info.md5 == [0u8; 16] || {
-        let computed =
-            crate::md5::audio_md5(&interleaved, info.bits_per_sample.div_ceil(8) as usize);
-        computed == info.md5
-    };
-
-    Some(DecodedStream {
+    let start = br.byte_pos();
+    let (interleaved, gaps) = decode_audio(&data[start..], &info)?;
+    Some(DecodedStream::new(
+        info,
         interleaved,
-        channels: info.channels,
-        bits_per_sample: info.bits_per_sample,
-        sample_rate: info.sample_rate,
-        total_samples: info.total_samples,
-        md5: info.md5,
-        md5_ok,
         seek_points,
         vorbis_comment,
-    })
+        gaps,
+    ))
+}
+
+impl DecodedStream {
+    /// Trim to the declared length and check the MD5.
+    fn new(
+        info: StreamInfo,
+        mut interleaved: Vec<i32>,
+        seek_points: Vec<SeekPoint>,
+        vorbis_comment: Option<DecodedVorbisComment>,
+        gaps: Vec<Gap>,
+    ) -> Self {
+        // Trim any encoder padding beyond the declared length.
+        if info.total_samples > 0 {
+            interleaved.truncate(info.total_samples as usize * info.channels as usize);
+        }
+        let md5_ok = info.md5 == [0u8; 16]
+            || crate::md5::audio_md5(&interleaved, info.bits_per_sample.div_ceil(8) as usize)
+                == info.md5;
+        DecodedStream {
+            interleaved,
+            channels: info.channels,
+            bits_per_sample: info.bits_per_sample,
+            sample_rate: info.sample_rate,
+            total_samples: info.total_samples,
+            md5: info.md5,
+            md5_ok,
+            seek_points,
+            vorbis_comment,
+            gaps,
+        }
+    }
+}
+
+/// Decode the audio frames of a stream described by `info`, filling gaps.
+fn decode_audio(frames: &[u8], info: &StreamInfo) -> Option<(Vec<i32>, Vec<Gap>)> {
+    let mut timeline = Timeline::new(Some(info));
+    let mut interleaved = Vec::new();
+    let mut br = BitReader::new(frames);
+    while br.byte_pos() < frames.len() {
+        let frame = decode_frame(&mut br, frames)?;
+        let start = timeline.place(&frame);
+        timeline.fill_gap(start, &frame, &mut interleaved);
+        push_samples(&frame, 0, &mut interleaved);
+    }
+    Some((interleaved, timeline.gaps))
+}
+
+/// Append a frame's samples from index `skip` on, interleaved.
+fn push_samples(frame: &Frame, skip: usize, out: &mut Vec<i32>) {
+    for i in skip..frame.blocksize {
+        for ch in &frame.samples {
+            out.push(ch[i]);
+        }
+    }
+}
+
+/// Where frames sit in the stream, and the silence that fills missing ones.
+struct Timeline {
+    /// Block size of fixed-block-size frames, once known (`fixed_block_size`).
+    fixed_block_size: u64,
+    /// STREAMINFO's block size when its minimum and maximum agree.
+    stream_block_size: Option<u64>,
+    /// STREAMINFO's sample rate, for frames whose header defers to it.
+    stream_sample_rate: u32,
+    /// The previous frame: first sample, block size, rate, channels, bit depth.
+    last: Option<(u64, u64, u32, u32, u32)>,
+    gaps: Vec<Gap>,
+}
+
+impl Timeline {
+    fn new(info: Option<&StreamInfo>) -> Self {
+        Timeline {
+            fixed_block_size: 0,
+            stream_block_size: info
+                .filter(|i| i.min_blocksize == i.max_blocksize)
+                .map(|i| u64::from(i.max_blocksize)),
+            stream_sample_rate: info.map_or(0, |i| i.sample_rate),
+            last: None,
+            gaps: Vec::new(),
+        }
+    }
+
+    /// The frame's first sample number (`read_frame_header_`,
+    /// `stream_decoder.c:2915`): given directly for variable block sizes, else the
+    /// frame number times the fixed block size, which comes from STREAMINFO or,
+    /// without it, from frame 0. (libFLAC rejects frame numbers when STREAMINFO's
+    /// minimum and maximum block sizes differ; this falls back to the frame's own
+    /// block size.)
+    fn place(&mut self, frame: &Frame) -> u64 {
+        let blocksize = frame.blocksize as u64;
+        let (sample, next_fixed) = match frame.number {
+            FrameNumber::Sample(s) => (s, 0),
+            FrameNumber::Frame(n) => {
+                let n = u64::from(n);
+                if self.fixed_block_size != 0 {
+                    (self.fixed_block_size * n, 0)
+                } else if let Some(bs) = self.stream_block_size {
+                    (bs * n, bs)
+                } else if n == 0 {
+                    (0, blocksize)
+                } else {
+                    (blocksize * n, 0)
+                }
+            }
+        };
+        if next_fixed != 0 {
+            self.fixed_block_size = next_fixed;
+        }
+        sample
+    }
+
+    /// Record a gap before the frame starting at `start` and append its silence
+    /// (`stream_decoder.c:2483-2550`), then remember the frame as the previous one.
+    fn fill_gap(&mut self, start: u64, frame: &Frame, out: &mut Vec<i32>) {
+        let format = self.format(frame);
+        if let Some((last_start, last_bs, last_rate, last_ch, last_bps)) = self.last {
+            let end = last_start + last_bs;
+            if end < start {
+                let missing = start - end;
+                let filled = if (last_rate, last_ch, last_bps) == format && last_bs >= 16 {
+                    missing.min(5 * u64::from(last_rate)).min(50 * last_bs)
+                } else {
+                    0
+                };
+                out.resize(out.len() + (filled * u64::from(last_ch)) as usize, 0);
+                self.gaps.push(Gap {
+                    first_sample: end,
+                    samples: missing,
+                    filled,
+                });
+            }
+        }
+        self.remember(start, frame);
+    }
+
+    /// Remember a frame as the previous one without checking for a gap.
+    fn remember(&mut self, start: u64, frame: &Frame) {
+        let (rate, channels, bps) = self.format(frame);
+        self.last = Some((start, frame.blocksize as u64, rate, channels, bps));
+    }
+
+    /// Sample rate (resolved against STREAMINFO), channels and bit depth.
+    fn format(&self, frame: &Frame) -> (u32, u32, u32) {
+        let rate = match frame.sample_rate {
+            0 => self.stream_sample_rate,
+            r => r,
+        };
+        (rate, frame.channels, frame.bits_per_sample)
+    }
 }
 
 /// Parse the `fLaC` marker and the metadata blocks (interpreting STREAMINFO,
-/// SEEKTABLE and VORBIS_COMMENT, skipping the rest), leaving `br` positioned at the first audio frame.
+/// SEEKTABLE and VORBIS_COMMENT, skipping the rest), leaving `br` positioned at
+/// the first audio frame.
 fn parse_header(
     br: &mut BitReader,
 ) -> Option<(StreamInfo, Vec<SeekPoint>, Option<DecodedVorbisComment>)> {
@@ -162,26 +308,7 @@ fn parse_header(
         let block_type = br.read_raw_u32(7)?;
         let length = br.read_raw_u32(24)? as usize;
         if block_type == 0 {
-            // STREAMINFO (34 bytes).
-            let _min_bs = br.read_raw_u32(16)?;
-            let _max_bs = br.read_raw_u32(16)?;
-            let _min_fs = br.read_raw_u32(24)?;
-            let _max_fs = br.read_raw_u32(24)?;
-            let sample_rate = br.read_raw_u32(20)?;
-            let channels = br.read_raw_u32(3)? + 1;
-            let bits_per_sample = br.read_raw_u32(5)? + 1;
-            let total_samples = br.read_raw_u64(36)?;
-            let mut md5 = [0u8; 16];
-            for b in &mut md5 {
-                *b = br.read_raw_u32(8)? as u8;
-            }
-            info = Some(StreamInfo {
-                sample_rate,
-                channels,
-                bits_per_sample,
-                total_samples,
-                md5,
-            });
+            info = Some(parse_streaminfo(br)?);
         } else if block_type == 3 {
             // SEEKTABLE: length / 18 points of (sample u64, offset u64, samples u16).
             let n = length / 18;
@@ -213,16 +340,44 @@ fn parse_header(
     Some((info?, seek_points, vorbis_comment))
 }
 
+/// The 34-byte STREAMINFO body.
+fn parse_streaminfo(br: &mut BitReader) -> Option<StreamInfo> {
+    let min_blocksize = br.read_raw_u32(16)?;
+    let max_blocksize = br.read_raw_u32(16)?;
+    let _min_fs = br.read_raw_u32(24)?;
+    let _max_fs = br.read_raw_u32(24)?;
+    let sample_rate = br.read_raw_u32(20)?;
+    let channels = br.read_raw_u32(3)? + 1;
+    let bits_per_sample = br.read_raw_u32(5)? + 1;
+    let total_samples = br.read_raw_u64(36)?;
+    let mut md5 = [0u8; 16];
+    for b in &mut md5 {
+        *b = br.read_raw_u32(8)? as u8;
+    }
+    Some(StreamInfo {
+        min_blocksize,
+        max_blocksize,
+        sample_rate,
+        channels,
+        bits_per_sample,
+        total_samples,
+        md5,
+    })
+}
+
 /// The result of a [`decode_seek`]: PCM from `first_sample` to the end of the
 /// stream.
 pub struct SeekResult {
     /// Interleaved PCM starting at `first_sample`.
     pub interleaved: Vec<i32>,
-    /// The first sample number the PCM begins at (the requested target).
+    /// The sample number the PCM begins at: the requested target, or the first
+    /// sample after it when the target lies in a missing frame.
     pub first_sample: u64,
     pub channels: u32,
     pub bits_per_sample: u32,
     pub sample_rate: u32,
+    /// Missing frames after `first_sample`, in stream order (see [`Gap`]).
+    pub gaps: Vec<Gap>,
 }
 
 /// The seek point to start decoding from for `target`: the non-placeholder point
@@ -244,9 +399,11 @@ fn seek_start(seek_points: &[SeekPoint], target: u64) -> (u64, u64) {
 
 /// Decode a stream starting at `target_sample`, using the SEEKTABLE (if any) to jump
 /// near it before decoding forward. Returns the interleaved PCM from `target_sample`
-/// to the end of the stream. `None` on malformed input, a CRC mismatch, or
-/// `target_sample >= total_samples` (when the total is known). With no seektable it
-/// still works by decoding from the first frame.
+/// to the end of the stream; frames are placed by their header numbers. As in
+/// libFLAC, gaps are filled only after the target is reached. `None` on malformed
+/// input, a CRC mismatch, an out-of-range sample, or `target_sample >=
+/// total_samples` (when the total is known). With no seektable it still works by
+/// decoding from the first frame.
 pub fn decode_seek(data: &[u8], target_sample: u64) -> Option<SeekResult> {
     let mut br = BitReader::new(data);
     let (info, seek_points, _) = parse_header(&mut br)?;
@@ -255,49 +412,75 @@ pub fn decode_seek(data: &[u8], target_sample: u64) -> Option<SeekResult> {
     }
     let audio_offset = br.byte_pos();
 
-    let (start_sample, start_offset) = seek_start(&seek_points, target_sample);
+    let (_, start_offset) = seek_start(&seek_points, target_sample);
     let start_byte = audio_offset.checked_add(start_offset as usize)?;
     let frames = data.get(start_byte..)?;
 
+    let mut timeline = Timeline::new(Some(&info));
     let mut fbr = BitReader::new(frames);
-    let mut current = start_sample;
+    let mut first_sample = None;
     let mut interleaved = Vec::new();
     while fbr.byte_pos() < frames.len() {
         let frame = decode_frame(&mut fbr, frames)?;
-        let frame_end = current + frame.blocksize as u64;
-        // Emit only the part of this frame at or after the target sample.
-        if frame_end > target_sample {
-            let skip = target_sample.saturating_sub(current) as usize;
-            for i in skip..frame.blocksize {
-                for ch in &frame.samples {
-                    interleaved.push(ch[i]);
-                }
+        let start = timeline.place(&frame);
+        if first_sample.is_none() {
+            // Skip frames before the target; emit the part at or after it.
+            timeline.remember(start, &frame);
+            if start + frame.blocksize as u64 > target_sample {
+                let skip = target_sample.saturating_sub(start);
+                first_sample = Some(start + skip);
+                push_samples(&frame, skip as usize, &mut interleaved);
             }
+            continue;
         }
-        current = frame_end;
+        timeline.fill_gap(start, &frame, &mut interleaved);
+        push_samples(&frame, 0, &mut interleaved);
     }
+    let first_sample = first_sample.unwrap_or(target_sample);
     if info.total_samples != 0 {
-        let want = (info.total_samples - target_sample) as usize * info.channels as usize;
+        let want =
+            info.total_samples.saturating_sub(first_sample) as usize * info.channels as usize;
         interleaved.truncate(want);
     }
 
     Some(SeekResult {
         interleaved,
-        first_sample: target_sample,
+        first_sample,
         channels: info.channels,
         bits_per_sample: info.bits_per_sample,
         sample_rate: info.sample_rate,
+        gaps: timeline.gaps,
     })
 }
 
-/// Decode a complete **Ogg FLAC** stream: `OggS` pages → FLAC packets → PCM. Parses
-/// the BOS mapping packet (`0x7F"FLAC"` + version + header count + `"fLaC"` +
-/// STREAMINFO), concatenates the audio-frame packets, and decodes them, verifying the
-/// audio MD5 against STREAMINFO. `None` on malformed Ogg (a bad page CRC or missing
-/// mapping) or any frame CRC mismatch. (Ogg FLAC carries no seektable, so
+/// Decode an **Ogg FLAC** stream: the first FLAC logical stream in `data`, up to
+/// its end-of-stream page, as libFLAC does by default. Pages of other logical
+/// streams (other codecs, or later links of a chained file) are ignored; use
+/// [`decode_ogg_chained`] for all links. Parses the mapping packet with STREAMINFO
+/// and the metadata packets, decodes the frame packets and verifies the audio MD5.
+/// `None` on malformed Ogg (a bad page CRC or missing mapping), a frame CRC
+/// mismatch, or an out-of-range sample. (Ogg FLAC carries no seektable, so
 /// `seek_points` is empty; the VORBIS_COMMENT packet is parsed.)
 pub fn decode_ogg(data: &[u8]) -> Option<DecodedStream> {
-    let packets = crate::ogg::read_packets(data)?;
+    let streams = crate::ogg::read_flac_streams(data, 1)?;
+    decode_ogg_link(streams.first()?)
+}
+
+/// Decode a **chained** Ogg FLAC stream: every FLAC logical stream in `data`, in
+/// order, one [`DecodedStream`] per link (libFLAC 1.5.0's
+/// `FLAC__stream_decoder_set_decode_chained_stream`). Links may differ in format;
+/// a single, unchained stream gives one link. `None` if any link fails as in
+/// [`decode_ogg`], or if `data` holds no FLAC stream.
+pub fn decode_ogg_chained(data: &[u8]) -> Option<Vec<DecodedStream>> {
+    let streams = crate::ogg::read_flac_streams(data, usize::MAX)?;
+    if streams.is_empty() {
+        return None;
+    }
+    streams.iter().map(|s| decode_ogg_link(s)).collect()
+}
+
+/// Decode the packets of one Ogg FLAC logical stream.
+fn decode_ogg_link(packets: &[Vec<u8>]) -> Option<DecodedStream> {
     let bos = packets.first()?;
     // BOS layout: 0x7F | "FLAC" | maj | min | num_headers(2) | "fLaC" | STREAMINFO(38)
     if bos.len() < 13 + 38 || bos[0] != 0x7F || &bos[1..5] != b"FLAC" || &bos[9..13] != b"fLaC" {
@@ -309,18 +492,7 @@ pub fn decode_ogg(data: &[u8]) -> Option<DecodedStream> {
         return None; // first metadata block must be STREAMINFO
     }
     let _len = sbr.read_raw_u32(24)?;
-    let _min_bs = sbr.read_raw_u32(16)?;
-    let _max_bs = sbr.read_raw_u32(16)?;
-    let _min_fs = sbr.read_raw_u32(24)?;
-    let _max_fs = sbr.read_raw_u32(24)?;
-    let sample_rate = sbr.read_raw_u32(20)?;
-    let channels = sbr.read_raw_u32(3)? + 1;
-    let bits_per_sample = sbr.read_raw_u32(5)? + 1;
-    let total_samples = sbr.read_raw_u64(36)?;
-    let mut md5 = [0u8; 16];
-    for b in &mut md5 {
-        *b = sbr.read_raw_u32(8)? as u8;
-    }
+    let info = parse_streaminfo(&mut sbr)?;
 
     // Audio frames are the packets from the first one with a 0x3FFE sync (high byte
     // 0xFF); the metadata packets (VORBIS_COMMENT, etc.) precede them.
@@ -333,35 +505,20 @@ pub fn decode_ogg(data: &[u8]) -> Option<DecodedStream> {
         .iter()
         .find(|p| p.first().is_some_and(|h| h & 0x7F == 4))
         .and_then(|p| parse_vorbis_comment(p.get(4..)?));
-    let mut frame_bytes = Vec::new();
-    if let Some(idx) = packets[1..].iter().position(|p| p.first() == Some(&0xFF)) {
-        for p in &packets[1 + idx..] {
-            frame_bytes.extend_from_slice(p);
-        }
-    }
-    let decoded = decode_frames(&frame_bytes)?;
-    let mut interleaved = decoded.interleaved;
-    if total_samples > 0 {
-        interleaved.truncate(total_samples as usize * channels as usize);
-    }
-    let md5_ok = md5 == [0u8; 16] || {
-        crate::md5::audio_md5(&interleaved, bits_per_sample.div_ceil(8) as usize) == md5
-    };
-
-    Some(DecodedStream {
+    let frame_bytes = packets[first_frame..].concat();
+    let (interleaved, gaps) = decode_audio(&frame_bytes, &info)?;
+    Some(DecodedStream::new(
+        info,
         interleaved,
-        channels,
-        bits_per_sample,
-        sample_rate,
-        total_samples,
-        md5,
-        md5_ok,
-        seek_points: Vec::new(),
+        Vec::new(),
         vorbis_comment,
-    })
+        gaps,
+    ))
 }
 
 struct StreamInfo {
+    min_blocksize: u32,
+    max_blocksize: u32,
     sample_rate: u32,
     channels: u32,
     bits_per_sample: u32,
@@ -369,10 +526,20 @@ struct StreamInfo {
     md5: [u8; 16],
 }
 
+/// The number in a frame header: the frame number (fixed block size) or the first
+/// sample number (variable block size).
+#[derive(Clone, Copy)]
+enum FrameNumber {
+    Frame(u32),
+    Sample(u64),
+}
+
 struct Frame {
+    number: FrameNumber,
     blocksize: usize,
     channels: u32,
     bits_per_sample: u32,
+    /// From the header; 0 means "see STREAMINFO".
     sample_rate: u32,
     /// Per-channel decoded PCM (already un-decorrelated to independent channels).
     samples: Vec<Vec<i32>>,
@@ -393,14 +560,13 @@ fn decode_frame(br: &mut BitReader, data: &[u8]) -> Option<Frame> {
     let bps_code = br.read_raw_u32(3)?;
     let _reserved2 = br.read_raw_u32(1)?;
     // Fixed block size carries the frame number (UTF-8 u32); variable carries the
-    // first sample number (UTF-8 u64). We track samples by summing block sizes, so
-    // the value is discarded — but the two forms consume different byte counts, so
-    // the right one must be read for the rest of the header (and CRC-8) to align.
-    if blocking_strategy == 0 {
-        let _frame_number = br.read_utf8_u32()?;
+    // first sample number (UTF-8 u64). `Timeline::place` turns either into the
+    // frame's position in the stream.
+    let number = if blocking_strategy == 0 {
+        FrameNumber::Frame(br.read_utf8_u32()?)
     } else {
-        let _sample_number = br.read_utf8_u64()?;
-    }
+        FrameNumber::Sample(br.read_utf8_u64()?)
+    };
 
     let blocksize = match bs_code {
         1 => 192,
@@ -481,12 +647,25 @@ fn decode_frame(br: &mut BitReader, data: &[u8]) -> Option<Frame> {
     }
     let _ = data; // backing slice is reached through the reader
 
+    // libFLAC 1.5.0 rejects a frame whose samples do not fit its bit depth
+    // (`ERROR_STATUS_OUT_OF_BOUNDS`, stream_decoder.c:2455), e.g. a side channel
+    // that reconstructs a channel out of range.
+    let limit = 1i64 << (bits_per_sample - 1);
+    let samples = undecorrelate(assignment, &chans, blocksize);
+    if samples.iter().flatten().any(|&v| v < -limit || v >= limit) {
+        return None;
+    }
+
     Some(Frame {
+        number,
         blocksize,
         channels,
         bits_per_sample,
         sample_rate,
-        samples: undecorrelate(assignment, &chans, blocksize),
+        samples: samples
+            .into_iter()
+            .map(|c| c.into_iter().map(|v| v as i32).collect())
+            .collect(),
     })
 }
 
@@ -592,42 +771,38 @@ fn decode_residual(br: &mut BitReader, blocksize: usize, order: usize) -> Option
     Some(residual)
 }
 
-/// Reverse the stereo decorrelation back to independent `i32` channels.
+/// Reverse the stereo decorrelation back to independent channels, in `i64` so a
+/// result outside the bit depth can be detected rather than wrapped.
 fn undecorrelate(
     assignment: ChannelAssignment,
     chans: &[Vec<i64>],
     blocksize: usize,
-) -> Vec<Vec<i32>> {
+) -> Vec<Vec<i64>> {
     match assignment {
-        ChannelAssignment::Independent => chans
-            .iter()
-            .map(|c| c.iter().map(|&s| s as i32).collect())
-            .collect(),
+        ChannelAssignment::Independent => chans.to_vec(),
         ChannelAssignment::LeftSide => {
             // ch0 = left, ch1 = side = left - right -> right = left - side.
             let (l, s) = (&chans[0], &chans[1]);
-            let left: Vec<i32> = l.iter().map(|&v| v as i32).collect();
-            let right: Vec<i32> = (0..blocksize).map(|i| (l[i] - s[i]) as i32).collect();
-            vec![left, right]
+            let right = (0..blocksize).map(|i| l[i] - s[i]).collect();
+            vec![l.clone(), right]
         }
         ChannelAssignment::RightSide => {
             // ch0 = side = left - right, ch1 = right -> left = right + side.
             let (s, r) = (&chans[0], &chans[1]);
-            let left: Vec<i32> = (0..blocksize).map(|i| (r[i] + s[i]) as i32).collect();
-            let right: Vec<i32> = r.iter().map(|&v| v as i32).collect();
-            vec![left, right]
+            let left = (0..blocksize).map(|i| r[i] + s[i]).collect();
+            vec![left, r.clone()]
         }
         ChannelAssignment::MidSide => {
             // ch0 = mid = (L+R)>>1 (LSB dropped), ch1 = side = L-R. The dropped LSB
             // equals side&1, so mid2 = (mid<<1)|(side&1) = L+R; L=(mid2+side)/2.
             let (m, s) = (&chans[0], &chans[1]);
-            let mut left = vec![0i32; blocksize];
-            let mut right = vec![0i32; blocksize];
+            let mut left = vec![0i64; blocksize];
+            let mut right = vec![0i64; blocksize];
             for i in 0..blocksize {
                 let side = s[i];
                 let mid2 = (m[i] << 1) | (side & 1);
-                left[i] = ((mid2 + side) >> 1) as i32;
-                right[i] = ((mid2 - side) >> 1) as i32;
+                left[i] = (mid2 + side) >> 1;
+                right[i] = (mid2 - side) >> 1;
             }
             vec![left, right]
         }
@@ -881,6 +1056,114 @@ mod tests {
     /// number) and confirm the decoder reads the wider header field, keeps CRC-8
     /// alignment, and decodes the subframe. A mono 16-bit CONSTANT frame, block
     /// size 4, sample number `0x123456` (a 4-byte UTF-8 code).
+    /// The byte range of every frame in a raw frame stream.
+    fn frame_ranges(data: &[u8]) -> Vec<(usize, usize)> {
+        let mut br = crate::bitreader::BitReader::new(data);
+        let mut ranges = Vec::new();
+        while br.byte_pos() < data.len() {
+            let start = br.byte_pos();
+            super::decode_frame(&mut br, data).expect("valid frame");
+            ranges.push((start, br.byte_pos()));
+        }
+        ranges
+    }
+
+    /// A frame cut out of the middle is reported as a gap and filled with silence
+    /// (libFLAC 1.5.0's missing-frame handling); one cut first is not filled.
+    #[test]
+    fn fills_missing_frames() {
+        let pcm = gen_pcm(3, 4096 * 6 + 100, 16, 2);
+        let frames = encode_frames(&pcm, 2, 16, 44_100, 4096, &preset(5));
+        let ranges = frame_ranges(&frames);
+        let without = |cut: usize| -> Vec<u8> {
+            ranges
+                .iter()
+                .enumerate()
+                .filter(|&(k, _)| k != cut)
+                .flat_map(|(_, &(a, b))| frames[a..b].iter().copied())
+                .collect()
+        };
+
+        let dec = decode_frames(&without(2)).unwrap();
+        assert_eq!(
+            dec.gaps,
+            [super::Gap {
+                first_sample: 2 * 4096,
+                samples: 4096,
+                filled: 4096,
+            }]
+        );
+        let mut expected = pcm.clone();
+        expected[2 * 4096 * 2..3 * 4096 * 2].fill(0);
+        assert_eq!(dec.interleaved, expected);
+
+        let dec = decode_frames(&without(0)).unwrap();
+        assert!(dec.gaps.is_empty());
+        assert_eq!(dec.interleaved, pcm[4096 * 2..]);
+    }
+
+    /// An 8-bit left/side frame whose right channel (left - side) exceeds 8 bits is
+    /// rejected (libFLAC 1.5.0: `OUT_OF_BOUNDS`) instead of wrapping.
+    #[test]
+    fn rejects_out_of_bounds_samples() {
+        let frame = |side: u32| {
+            let mut bw = BitWriter::new();
+            bw.write_raw_u32(0x3FFE, 14); // sync
+            bw.write_raw_u32(0, 2); // reserved, fixed block size
+            bw.write_raw_u32(6, 4); // block size: 8-bit field follows
+            bw.write_raw_u32(9, 4); // 44.1 kHz
+            bw.write_raw_u32(8, 4); // left/side
+            bw.write_raw_u32(1, 3); // 8 bits per sample
+            bw.write_raw_u32(0, 1); // reserved
+            bw.write_raw_u32(0, 8); // frame number 0
+            bw.write_raw_u32(16 - 1, 8); // block size 16
+            let crc = bw.crc8();
+            bw.write_raw_u32(crc as u32, 8);
+            bw.write_raw_u32(0x00, 8); // left: CONSTANT 127 (8 bits)
+            bw.write_raw_u32(127, 8);
+            bw.write_raw_u32(0x00, 8); // side: CONSTANT (9 bits)
+            bw.write_raw_u32(side, 9);
+            bw.zero_pad_to_byte_boundary();
+            let crc = bw.crc16();
+            bw.write_raw_u32(crc as u32, 16);
+            bw.as_bytes().to_vec()
+        };
+        assert_eq!(decode_frames(&frame(0)).unwrap().interleaved, [127; 32]);
+        // side = -128 (9-bit two's complement): right = 127 + 128 = 255.
+        assert!(decode_frames(&frame(0x180)).is_none());
+    }
+
+    /// Chained Ogg FLAC: `decode_ogg` takes the first link, `decode_ogg_chained`
+    /// all of them, each with its own format.
+    #[test]
+    fn decodes_chained_ogg() {
+        let first = gen_pcm(1, 5000, 16, 1);
+        let second = gen_pcm(2, 7000, 24, 2);
+        let meta = [MetadataBlock::VorbisComment(LIBFLAC_VENDOR_STRING)];
+        let mut chained = encode_ogg(&first, 1, 16, 44_100, 4096, &preset(5), true, &meta, 7);
+        chained.extend(encode_ogg(
+            &second,
+            2,
+            24,
+            96_000,
+            4096,
+            &preset(8),
+            true,
+            &meta,
+            7,
+        ));
+
+        let dec = super::decode_ogg(&chained).unwrap();
+        assert_eq!((dec.channels, dec.interleaved), (1, first.clone()));
+
+        let links = super::decode_ogg_chained(&chained).unwrap();
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0].interleaved, first);
+        assert_eq!((links[1].channels, links[1].sample_rate), (2, 96_000));
+        assert_eq!(links[1].interleaved, second);
+        assert!(links.iter().all(|l| l.md5_ok && l.gaps.is_empty()));
+    }
+
     #[test]
     fn decodes_variable_block_size_frame() {
         let mut bw = BitWriter::new();

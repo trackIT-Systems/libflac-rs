@@ -1,5 +1,5 @@
-//! The C reference encoder — libFLAC 1.5.0 with libogg 1.3.5 — behind the same
-//! settings types as `libflac-rs`, for differential tests.
+//! The C reference encoder and decoder — libFLAC 1.5.0 with libogg 1.3.5 — behind
+//! the same settings types as `libflac-rs`, for differential tests.
 //!
 //! Each function encodes with libFLAC configured from a [`libflac_rs::EncoderConfig`]
 //! and mirrors the [`libflac_rs::Encoder`] method of the same name, so a test is
@@ -119,6 +119,28 @@ unsafe extern "C" {
     ) -> i32;
     fn libflac_rs_oracle_free(buf: *mut u8);
     fn libflac_rs_oracle_vendor_string() -> *const c_char;
+    #[allow(clippy::too_many_arguments)]
+    fn libflac_rs_oracle_decode(
+        data: *const u8,
+        len: usize,
+        is_ogg: u32,
+        chained: u32,
+        pcm: *mut *mut i32,
+        pcm_len: *mut usize,
+        links: *mut *mut LinkC,
+        num_links: *mut usize,
+        errors: *mut *mut i32,
+        num_errors: *mut usize,
+    ) -> i32;
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LinkC {
+    channels: u32,
+    bits_per_sample: u32,
+    sample_rate: u32,
+    first: u64,
 }
 
 const MODE_FRAMES: u32 = 0;
@@ -343,4 +365,104 @@ pub fn vendor_string() -> String {
     unsafe { CStr::from_ptr(libflac_rs_oracle_vendor_string()) }
         .to_string_lossy()
         .into_owned()
+}
+
+/// One decoded stream (or Ogg chain link) as libFLAC's decoder delivers it,
+/// including any silence it inserted for missing frames.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedLink {
+    pub channels: u32,
+    pub bits_per_sample: u32,
+    pub sample_rate: u32,
+    pub interleaved: Vec<i32>,
+}
+
+/// `FLAC__StreamDecoderErrorStatus` values the decoder can report.
+pub mod error {
+    pub const LOST_SYNC: i32 = 0;
+    pub const BAD_HEADER: i32 = 1;
+    pub const FRAME_CRC_MISMATCH: i32 = 2;
+    pub const UNPARSEABLE_STREAM: i32 = 3;
+    pub const BAD_METADATA: i32 = 4;
+    pub const OUT_OF_BOUNDS: i32 = 5;
+    pub const MISSING_FRAME: i32 = 6;
+}
+
+/// What libFLAC's decoder produced: the links in order, and the error statuses it
+/// reported (see [`error`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Decoded {
+    pub links: Vec<DecodedLink>,
+    pub errors: Vec<i32>,
+}
+
+/// Decode with libFLAC: native FLAC or raw frames when `ogg` is false, Ogg FLAC
+/// otherwise, following all chain links when `chained` is set
+/// (`FLAC__stream_decoder_set_decode_chained_stream`). MD5 checking is off.
+pub fn decode(data: &[u8], ogg: bool, chained: bool) -> Decoded {
+    let (mut pcm, mut pcm_len) = (ptr::null_mut::<i32>(), 0usize);
+    let (mut links, mut num_links) = (ptr::null_mut::<LinkC>(), 0usize);
+    let (mut errors, mut num_errors) = (ptr::null_mut::<i32>(), 0usize);
+    // SAFETY: `data` outlives the call; the C side hands back malloc'd buffers of
+    // the stated lengths (or null when empty), copied and then freed below.
+    let rc = unsafe {
+        libflac_rs_oracle_decode(
+            data.as_ptr(),
+            data.len(),
+            ogg.into(),
+            chained.into(),
+            &mut pcm,
+            &mut pcm_len,
+            &mut links,
+            &mut num_links,
+            &mut errors,
+            &mut num_errors,
+        )
+    };
+    assert!(rc >= 0, "libFLAC decode failed (shim code {rc})");
+    // SAFETY: as above; a null pointer only comes with a zero length.
+    let copy = |p: *const u8, n: usize| -> Vec<u8> {
+        if p.is_null() {
+            Vec::new()
+        } else {
+            unsafe { std::slice::from_raw_parts(p, n) }.to_vec()
+        }
+    };
+    let pcm_vec: Vec<i32> = copy(pcm.cast(), pcm_len * 4)
+        .chunks_exact(4)
+        .map(|b| i32::from_ne_bytes(b.try_into().unwrap()))
+        .collect();
+    let link_vec: Vec<LinkC> = (0..num_links)
+        // SAFETY: `links` holds `num_links` initialized entries.
+        .map(|i| unsafe { *links.add(i) })
+        .collect();
+    let error_vec: Vec<i32> = copy(errors.cast(), num_errors * 4)
+        .chunks_exact(4)
+        .map(|b| i32::from_ne_bytes(b.try_into().unwrap()))
+        .collect();
+    // SAFETY: each buffer came from malloc (or is null).
+    unsafe {
+        libflac_rs_oracle_free(pcm.cast());
+        libflac_rs_oracle_free(links.cast());
+        libflac_rs_oracle_free(errors.cast());
+    }
+    let ends: Vec<usize> = link_vec
+        .iter()
+        .skip(1)
+        .map(|l| l.first as usize)
+        .chain([pcm_vec.len()])
+        .collect();
+    Decoded {
+        links: link_vec
+            .iter()
+            .zip(ends)
+            .map(|(l, end)| DecodedLink {
+                channels: l.channels,
+                bits_per_sample: l.bits_per_sample,
+                sample_rate: l.sample_rate,
+                interleaved: pcm_vec[l.first as usize..end].to_vec(),
+            })
+            .collect(),
+        errors: error_vec,
+    }
 }

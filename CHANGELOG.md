@@ -33,7 +33,19 @@ since 0.143.1:
   `vorbis_comment_entry` to build `NAME=value` entries with libFLAC's checks. The
   decoder returns the block as `DecodedStream::vorbis_comment` (native and Ogg).
 - The C differential oracle runs in CI: `oracle/` compiles libFLAC 1.5.0 + libogg
-  1.3.5 and compares whole outputs through the public API, on glibc and musl.
+  1.3.5 and compares whole outputs through the public API, on glibc and musl. It
+  also compares decoded samples with libFLAC's decoder.
+- libFLAC 1.5.0's decoder changes:
+  - `decode_ogg_chained` decodes every link of a chained Ogg FLAC stream, one
+    `DecodedStream` each. `decode_ogg` decodes the first FLAC logical stream and
+    ignores pages of other streams, as libFLAC does by default (chained files used
+    to fail).
+  - Missing frames: positions come from the frame headers, gaps are filled with
+    silence under libFLAC's rules (same format, at most 5 s and 50 blocks) and
+    listed in the new `gaps` field of `DecodedStream`, `DecodedFrames` and
+    `SeekResult` (`Gap`). Before, the samples after a gap were shifted.
+  - A frame whose samples exceed its bit depth makes decoding fail, as libFLAC
+    rejects it (`OUT_OF_BOUNDS`); before, the samples wrapped.
 
 ### Fixed
 
@@ -45,5 +57,5 @@ since 0.143.1:
 - Like libFLAC, the encoder uses the platform libm (`cosf`, `log`). Output can
   differ between glibc, musl and macOS in rare cases (14 of 2916 test streams
   between glibc and musl); see `ORACLE.md`.
-- The decoder is not byte-parity work and does not yet include libFLAC 1.5.0's
-  decoder additions (chained Ogg streams, missing-frame and out-of-bounds checks).
+- The decoder stops at a corrupt frame (CRC mismatch, out-of-range samples) where
+  libFLAC resynchronizes and continues.

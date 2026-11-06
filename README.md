@@ -26,8 +26,10 @@ dependencies, no build script and no `unsafe`.
     tags, PADDING, APPLICATION, SEEKTABLE (filled in during encoding), CUESHEET,
     PICTURE
 - **Decoder**
-  - native and Ogg FLAC, fixed and variable block sizes
+  - native and Ogg FLAC, including chained Ogg streams; fixed and variable block
+    sizes
   - MD5 verification, SEEKTABLE-based seeking, tags
+  - missing frames are reported and filled with silence as libFLAC 1.5.0 does
   - lossless: it decodes everything the encoder produces and libFLAC's output
 - Pure Rust, `#![forbid(unsafe_code)]`, zero dependencies, Rust 1.85+
 
@@ -95,17 +97,19 @@ The full API is documented in the crate docs (`cargo doc --open`).
   math library, whose last-bit rounding differs between glibc, musl and macOS. The
   output matches libFLAC built on the same platform and can differ between
   platforms in rare cases. Measurements are in [`ORACLE.md`](ORACLE.md).
-- **Decoder.** The decoder is checked for losslessness, not byte parity, and does
-  not yet include libFLAC 1.5.0's decoder additions such as chained Ogg streams
-  ([#2](https://github.com/trackIT-Systems/libflac-rs/issues/2)).
+- **Decoder.** Byte-identical output is an encoder property; the decoder is
+  checked for producing the same samples as libFLAC 1.5.0's decoder, including
+  chained Ogg links and the silence it inserts for missing frames. Unlike libFLAC,
+  it does not resynchronize after a corrupt frame (bad CRC, or samples beyond the
+  bit depth): decoding then fails.
 
 ## How it is verified
 
 The separate `oracle/` crate compiles the C libFLAC 1.5.0 and libogg 1.3.5 from the
 Xiph release tags and compares complete encoder outputs byte for byte, through the
 public API. It covers all levels, bit depths, channel counts, block sizes, sample
-rates and metadata blocks, and runs in CI on glibc and musl. The library itself
-never builds C.
+rates and metadata blocks, and compares decoded samples with libFLAC's decoder. It
+runs in CI on glibc and musl. The library itself never builds C.
 
 ```sh
 cargo test                                            # the library: unit and round-trip tests
