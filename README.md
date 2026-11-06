@@ -37,6 +37,15 @@ output differs from 1.4.3 only where 1.5.0 changed it:
 None of these touch MAME/CHD's configuration (level 8, 16-bit stereo, raw frames),
 so CHD audio stays byte-identical to the libFLAC 1.4.3 that MAME ships.
 
+### Platform
+
+Like libFLAC, the encoder uses the platform's math library (`cosf` for the
+apodization windows, `log` for bit estimates), whose last-bit rounding differs
+between glibc, musl and macOS. The output is byte-identical to libFLAC **built on
+the same platform**, and can differ between platforms in rare cases (14 of 2916
+test streams between glibc and musl). CI checks against libFLAC on glibc and musl;
+see [`ORACLE.md`](ORACLE.md).
+
 ## Usage
 
 ```rust

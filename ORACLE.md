@@ -36,14 +36,28 @@ steps in the `oracle` job (`.github/workflows/ci.yml`), on `ubuntu-latest` only.
 framing, rice coding, metadata, Ogg paging, …). A failure lists every mismatching
 case with the offset of its first differing byte.
 
-### The float-parity environment matters
+### The output depends on the platform libm — on purpose
 
-glibc is the parity reference — it is what MAME/chdman use — so `f32::cos` resolves
-to the same `cosf`, and `f64::round() as i32` to the same `lround`
-(round-half-away-from-zero, C99, via `HAVE_LROUND=1`). A different libm on either
-side can diverge in the windowing / quantization float math, which is why CI runs
-the oracle on Linux only. The C side is also built `FLAC__NO_ASM` (deterministic,
-platform-independent, matches x86 chdman — see [`CLAUDE.md`](CLAUDE.md) → "SIMD vs
+Two libm functions feed encoder decisions: `cosf` (the apodization windows) and
+`log` (the fixed-predictor and LPC-order bit estimates). Their last-bit rounding
+differs between C libraries, so **libFLAC itself produces slightly different bytes
+on glibc, musl and macOS**. The Rust port calls the same functions through `std`
+(`f32::cos`, `f64::ln`), which resolve to the platform libm, so it reproduces
+libFLAC **built on the same platform**. The oracle compares like with like and
+passes on each of them. `f64::round() as i32` matches C99 `lround` (half away from
+zero, `HAVE_LROUND=1`) everywhere.
+
+Measured on 2026-11-06 (glibc 2.36, musl 1.2.5, macOS 27):
+
+| vs. glibc amd64 | glibc arm64 | musl amd64/arm64 | macOS arm64 |
+| --- | --- | --- | --- |
+| `cosf`, every `f32` in [0, 7) | identical | ~1.5% of 4096-value chunks differ | ~2.5% differ |
+| `log`, 2·10⁸ samples | identical | 96 of 3051 chunks differ | every chunk differs |
+| encoder output, 2916 streams | — | 14 differ | 8 differ |
+
+CI runs the oracle on glibc (`oracle`) and musl (`oracle-musl`). glibc stays the
+reference for the documented float hazards (see [`CLAUDE.md`](CLAUDE.md)). The C
+side is built `FLAC__NO_ASM` (deterministic, matches x86 chdman — see "SIMD vs
 scalar") and with `-ffp-contract=off`, so clang/gcc never fuse a multiply-add the
 Rust port keeps separate (they would on arm64).
 

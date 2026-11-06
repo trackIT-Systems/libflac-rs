@@ -284,6 +284,10 @@ residual/rice → CRC-16 — diffing at the first mismatching field.
 - Faithful transcription over "improved" Rust when bit-exactness is at stake;
   idiomatic refactors are fine only for plumbing that cannot affect output bytes.
 - Keep `*.c:NNN` citations in module docs accurate when you touch the code.
+- Transcendentals (`f32::cos`, `f64::ln`) go through the platform libm, like
+  libFLAC's: output matches libFLAC built on the same platform and may differ
+  between glibc, musl and macOS (decided 2026-11-06; measurements in `ORACLE.md`).
+  Don't replace them with a bundled implementation without revisiting that.
 - Library is `#![forbid(unsafe_code)]`, edition 2024, MSRV 1.85, **zero
   dependencies** (pure `std`, not even a build script) — keep it that way. C and
   `cc` live only in the separate `oracle/` workspace; see `ORACLE.md`.

@@ -5,8 +5,10 @@
 //!
 //! All coefficients are `f32` (`FLAC__real`). The transcendental is `cosf`: the
 //! argument is formed in `f64` (`M_PI * n / Np`, matching C's `double`-precision
-//! `M_PI`) and narrowed to `f32` before the cosine, exactly as the C does. Built
-//! and run under glibc so Rust's `f32::cos` resolves to the same libm `cosf`.
+//! `M_PI`) and narrowed to `f32` before the cosine, exactly as the C does.
+//! `f32::cos` resolves to the platform libm's `cosf`, as libFLAC's call does, so
+//! the coefficients match libFLAC built on the same platform (they differ in the
+//! last bit between glibc, musl and macOS; see `ORACLE.md`).
 
 use std::f64::consts::PI;
 
