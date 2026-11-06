@@ -5,18 +5,20 @@ name = "libflac-rs"
 # libFLAC release this crate is bit-exact with (1.5.0 -> 150); the patch counts
 # our own fixes against that target (0.150.0, 0.150.1, ...). The leading 0 marks
 # the public API as still unstable. Retargeting a new libFLAC bumps the minor.
-# Keep in sync with the git tag (v0.150.0).
-version = "0.150.0"
+# Keep in sync with the git tag (v0.150.1).
+version = "0.150.1"
 edition = "2024"
 rust-version = "1.85"
 license = "BSD-3-Clause"
 description = "Bit-exact pure-Rust port of libFLAC 1.5.0: a complete FLAC encoder and decoder (incl. Ogg FLAC) byte-identical to the C reference."
-repository = "https://github.com/danifunker/libflac-rs"
-documentation = "https://docs.rs/libflac-rs"
+repository = "https://github.com/trackIT-Systems/libflac-rs"
+# Released as GitHub releases only; the crates.io name belongs to upstream
+# (danifunker/libflac-rs).
+publish = false
 keywords = ["flac", "audio", "lossless", "chd", "encoder"]
 categories = ["multimedia::audio", "multimedia::encoding"]
 readme = "README.md"
-# The published crate is a pure-Rust, dependency-free library plus its docs (src,
+# The packaged crate is a pure-Rust, dependency-free library plus its docs (src,
 # README/ROADMAP/ORACLE/LICENSE). Drop the AI dev guide, the CI config and the
 # differential-test crate `oracle/` (its own workspace; the only place C and `cc`
 # appear — see ORACLE.md).

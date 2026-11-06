@@ -13,7 +13,7 @@ and **complete `.flac` files** at **every standard bit depth (8–32)** — and 
 CUESHEET), a complete decoder with `seek()` and variable-block-size support,
 **byte-exact Ogg FLAC** (encode + decode) verified against libFLAC+libogg, and a
 documented, zero-dependency **public API** (`Encoder`/`EncoderConfig` + `decode*`).
-All that remains is dispatching the crates.io release (a maintainer action).
+Releases are GitHub releases of the trackIT-Systems fork (see `CHANGELOG.md`).
 
 **Since 0.150.0 the target is libFLAC 1.5.0.** The phases below record the 1.4.3
 bring-up (C line citations there refer to 1.4.3); the retarget is milestone R1 in

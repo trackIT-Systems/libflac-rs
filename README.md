@@ -46,6 +46,17 @@ the same platform**, and can differ between platforms in rare cases (14 of 2916
 test streams between glibc and musl). CI checks against libFLAC on glibc and musl;
 see [`ORACLE.md`](ORACLE.md).
 
+## Installation
+
+Released as GitHub releases of this repository (not on crates.io):
+
+```toml
+[dependencies]
+libflac-rs = { git = "https://github.com/trackIT-Systems/libflac-rs", tag = "v0.150.1" }
+```
+
+See [`CHANGELOG.md`](CHANGELOG.md) for what changed.
+
 ## Usage
 
 ```rust

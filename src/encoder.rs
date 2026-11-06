@@ -1059,8 +1059,8 @@ pub fn encode_ogg(
 /// Audio format and compression settings for an [`Encoder`].
 ///
 /// Build one with [`EncoderConfig::new`] (libFLAC's defaults: compression level 8,
-/// 4096-sample blocks, MD5 on) or [`EncoderConfig::chd`] (MAME/CHD's exact
-/// configuration), then adjust with the `with_*` methods if needed.
+/// libFLAC's default block size, MD5 on) or [`EncoderConfig::chd`] (MAME/CHD's
+/// exact configuration), then adjust with the `with_*` methods if needed.
 #[derive(Clone, Copy, Debug)]
 pub struct EncoderConfig {
     /// Number of channels, 1–8. Stereo (2) enables mid/side decorrelation.
@@ -1069,8 +1069,9 @@ pub struct EncoderConfig {
     pub bits_per_sample: u32,
     /// Sample rate in Hz.
     pub sample_rate: u32,
-    /// Fixed block size in samples (the final frame may be shorter). libFLAC's
-    /// default is 4096; CHD uses 2048.
+    /// Fixed block size in samples (the final frame may be shorter). `0` selects
+    /// libFLAC's default when the [`Encoder`] is created (`stream_encoder.c:748`):
+    /// 1152 for compression levels 0–2 (no LPC), 4096 otherwise. CHD uses 2048.
     pub block_size: u32,
     /// Compression preset, 0 (fastest) … 8 (smallest); values above 8 clamp to 8.
     pub compression_level: u32,
@@ -1081,13 +1082,13 @@ pub struct EncoderConfig {
 
 impl EncoderConfig {
     /// A config for the given format at libFLAC's defaults: compression level 8,
-    /// 4096-sample blocks, MD5 enabled.
+    /// libFLAC's default block size (`block_size` 0, see the field), MD5 enabled.
     pub fn new(channels: u32, bits_per_sample: u32, sample_rate: u32) -> Self {
         Self {
             channels,
             bits_per_sample,
             sample_rate,
-            block_size: 4096,
+            block_size: 0,
             compression_level: 8,
             md5: true,
         }
@@ -1113,7 +1114,7 @@ impl EncoderConfig {
         self.compression_level = level;
         self
     }
-    /// Set the fixed block size in samples.
+    /// Set the fixed block size in samples (`0`: libFLAC's default for the level).
     pub fn with_block_size(mut self, block_size: u32) -> Self {
         self.block_size = block_size;
         self
@@ -1146,12 +1147,16 @@ pub struct Encoder {
 
 impl Encoder {
     /// Create an encoder from `config`.
-    pub fn new(config: EncoderConfig) -> Self {
+    pub fn new(mut config: EncoderConfig) -> Self {
         let inner = preset(config.compression_level);
+        if config.block_size == 0 {
+            config.block_size = if inner.max_lpc_order == 0 { 1152 } else { 4096 };
+        }
         Self { config, inner }
     }
 
-    /// The configuration this encoder was built with.
+    /// The configuration this encoder was built with, with a `block_size` of 0
+    /// resolved to libFLAC's default.
     pub fn config(&self) -> &EncoderConfig {
         &self.config
     }

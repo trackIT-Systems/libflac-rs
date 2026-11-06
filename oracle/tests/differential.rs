@@ -497,3 +497,42 @@ fn seektable_targets_past_end() {
     }
     failures.assert_none();
 }
+
+/// No block size set: libFLAC picks 1152 for levels without LPC (0–2) and 4096
+/// otherwise (`stream_encoder.c:748`); `EncoderConfig::new` leaves it at 0 too.
+#[test]
+fn default_block_size() {
+    let mut failures = Failures::default();
+    for channels in [1, 2] {
+        let pcm = signal(channels, 16, 1152, 12, u64::from(channels));
+        for level in LEVELS {
+            let cfg = EncoderConfig::new(channels, 16, 44_100).with_compression_level(level);
+            assert_eq!(cfg.block_size, 0);
+            let enc = Encoder::new(cfg);
+            let expected = if level <= 2 { 1152 } else { 4096 };
+            if enc.config().block_size != expected {
+                failures.0.push(format!(
+                    "{channels}ch level {level}: block size {} instead of {expected}",
+                    enc.config().block_size
+                ));
+            }
+            let label = format!("{channels}ch level {level}");
+            failures.check(
+                format_args!("{label} frames"),
+                &enc.encode_frames(&pcm),
+                &oracle::encode_frames(&cfg, &pcm),
+            );
+            failures.check(
+                format_args!("{label} stream"),
+                &enc.encode(&pcm),
+                &oracle::encode(&cfg, &pcm),
+            );
+            failures.check(
+                format_args!("{label} ogg"),
+                &enc.encode_ogg(&pcm, 3),
+                &oracle::encode_ogg(&cfg, &pcm, 3),
+            );
+        }
+    }
+    failures.assert_none();
+}
