@@ -1,0 +1,12 @@
+version: 2
+updates:
+  # The workflows pin actions to commit SHAs; this keeps them current.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+  # The oracle's build dependency (`cc`); the library itself has none.
+  - package-ecosystem: cargo
+    directory: /oracle
+    schedule:
+      interval: weekly

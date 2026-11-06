@@ -20,7 +20,8 @@ from the package) that depends on `libflac-rs` by path. Only it uses `cc`.
 
 Both are BSD-3-Clause (Xiph.Org). The sources are **not vendored**:
 `oracle/fetch-sources.sh` shallow-clones the release tags into `oracle/vendor/`
-(gitignored).
+(gitignored) and checks that each is at the expected commit (libFLAC `1507800`,
+libogg `e1774cd`), so a moved tag is refused.
 
 ## 2. Running it
 

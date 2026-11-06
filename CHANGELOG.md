@@ -4,6 +4,23 @@ Releases are GitHub releases of this repository (not crates.io). Versions follow
 `0.<libFLAC digits>.<patch>`: the minor is the libFLAC release the encoder is
 bit-exact with, the patch counts our own changes against it.
 
+## Unreleased
+
+### Fixed
+
+- The decoder no longer panics on malformed input. It now rejects what libFLAC
+  rejects (wasted bits not below the bit depth, residual partitions smaller than
+  the predictor order or not dividing the block, reserved coding methods, FIXED
+  orders and LPC precisions, negative LPC shifts) and uses wrapping arithmetic
+  where garbage can overflow; such input makes `decode*` return `None`. Found by
+  fuzzing; `tests/malformed_input.rs` decodes 30 000 mutated streams in CI.
+
+### Development
+
+- CI runs with a read-only token, actions are pinned to commit SHAs and kept
+  current by Dependabot, and `oracle/fetch-sources.sh` refuses libFLAC/libogg
+  checkouts that are not at the expected commits.
+
 ## 0.150.1
 
 First release targeting **libFLAC 1.5.0** (`v0.150.0` is a tag only). Changes
