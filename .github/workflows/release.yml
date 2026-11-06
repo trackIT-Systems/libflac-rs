@@ -5,14 +5,20 @@ name: Release
 # Cargo.toml).
 #
 # Flow: bump the version in Cargo.toml, add its CHANGELOG.md section, tag the
-# commit (vX.Y.Z) and push the tag, then dispatch this workflow with the tag.
+# commit (vX.Y.Z) and push the tag; pushing it creates the release. To retry for
+# an existing tag, dispatch this workflow with the tag.
 
 on:
+  push:
+    tags: ['v*']
   workflow_dispatch:
     inputs:
       tag:
         description: 'Existing tag to release, e.g. v0.150.1'
         required: true
+
+env:
+  TAG: ${{ inputs.tag || github.ref_name }}
 
 permissions:
   contents: write
@@ -23,12 +29,10 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ inputs.tag }}
+          ref: ${{ env.TAG }}
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Verify Cargo.toml version matches the tag
-        env:
-          TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
@@ -40,8 +44,6 @@ jobs:
       - run: cargo test --locked
 
       - name: Release notes from CHANGELOG.md
-        env:
-          TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
           awk -v h="## ${TAG#v}" 'index($0, h) == 1 {f = 1; next} /^## / && f {exit} f' \
@@ -54,5 +56,4 @@ jobs:
       - name: Create the GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ inputs.tag }}
         run: gh release create "$TAG" --verify-tag --title "$TAG" --notes-file notes.md

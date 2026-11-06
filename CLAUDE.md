@@ -203,7 +203,7 @@ residual/rice → CRC-16 — diffing at the first mismatching field.
   `#![allow(dead_code)]` is gone (only two targeted allows on faithful bit-writer
   mirrors). CI vendors libFLAC + libogg for a self-contained differential build;
   `cargo package` produces a slim, leak-free pure-Rust tarball. Releases are
-  GitHub releases (`release.yml`, dispatched with an existing tag, notes from
+  GitHub releases (`release.yml`, run by pushing a `v*` tag, notes from
   `CHANGELOG.md`); this fork has `publish = false`, as the crates.io name belongs
   to upstream. The
   CD subcode-split + `'L'`/`'B'` endian-trial wrapper stays in chd-rs.
