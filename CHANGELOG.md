@@ -29,9 +29,24 @@ bit-exact with, the patch counts our own changes against it.
   Vorbis comments that are not `NAME=value`).
 - Every bit depth from 4 to 32, in the encoder (byte-identical to libFLAC) and the
   decoder.
+- `truncated` on `DecodedStream`, `DecodedFrames`, `SeekResult` and
+  `StreamDecoder::truncated()` (see below).
+- Fuzz targets (`fuzz/`, cargo-fuzz): decoder robustness, encoder round trips,
+  and differential encoding and decoding against libFLAC.
 
 ### Changed
 
+- Input that ends in the middle of a frame (or Ogg page) ends the stream after
+  the last complete frame, as in libFLAC, instead of failing; `truncated` says so
+  and the MD5 check fails. Junk or damaged pages between Ogg pages are skipped, as
+  libogg does.
+- The decoder reconstructs samples with libFLAC's arithmetic (32-bit, wrapping,
+  where libFLAC uses 32 bits), so damaged frames with a valid CRC decode to the
+  same samples, and it checks frame and subframe headers as libFLAC does
+  (reserved bits, invalid UTF-8 numbers, block size 65536, reserved subframe
+  types, a set padding bit, predictor orders not below the block size; a frame
+  number counts as a sample number when STREAMINFO's block sizes differ). Found by
+  differential fuzzing.
 - `Encoder::new` and the `encode*` methods panic with the `EncodeError` on
   invalid settings or input. Before, they wrote a corrupt stream or decoded to
   different samples without notice.

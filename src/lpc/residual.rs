@@ -63,6 +63,13 @@ fn max_prediction_value_before_shift(subframe_bps: u32, qlp_coeff: &[i32], order
     (1u64 << (subframe_bps - 1)) * u64::from(abs_sum)
 }
 
+/// Max bits in the predictor sum before the shift
+/// (`FLAC__lpc_max_prediction_before_shift_bps`, `lpc.c:952`). The decoder uses
+/// it, with [`max_residual_bps`], to pick libFLAC's 32- or 64-bit restore.
+pub fn max_prediction_before_shift_bps(subframe_bps: u32, qlp_coeff: &[i32], order: usize) -> u32 {
+    silog2(max_prediction_value_before_shift(subframe_bps, qlp_coeff, order) as i64)
+}
+
 /// Max bits in a residual sample (`FLAC__lpc_max_residual_bps`, `lpc.c:962`): the
 /// largest sample magnitude plus the largest prediction after the shift, rounded
 /// up (`-((-v) >> shift)`). When this exceeds 32 the encoder must use the

@@ -11,6 +11,7 @@
 use crate::bitreader::BitReader;
 use crate::crc::{crc8, crc16};
 use crate::frame::ChannelAssignment;
+use crate::lpc;
 use crate::metadata::{SEEKPOINT_PLACEHOLDER, SeekPoint};
 use crate::stream::{DecodeError, DecodeOptions, StreamDecoder};
 
@@ -62,6 +63,9 @@ pub struct DecodedFrames {
     pub sample_rate: u32,
     /// Missing frames, in stream order (see [`Gap`]).
     pub gaps: Vec<Gap>,
+    /// The input ended in the middle of a frame, which was dropped (as libFLAC
+    /// does).
+    pub truncated: bool,
 }
 
 /// Decode every audio frame in `data` (the raw frame stream produced by
@@ -77,6 +81,7 @@ pub fn decode_frames(data: &[u8]) -> Option<DecodedFrames> {
             bits_per_sample: 0,
             sample_rate: 0,
             gaps: Vec::new(),
+            truncated: false,
         });
     }
     if data[0] != 0xFF {
@@ -89,6 +94,7 @@ pub fn decode_frames(data: &[u8]) -> Option<DecodedFrames> {
         bits_per_sample: stream.bits_per_sample,
         sample_rate: stream.sample_rate,
         gaps: stream.gaps,
+        truncated: stream.truncated,
     })
 }
 
@@ -113,6 +119,10 @@ pub struct DecodedStream {
     /// Missing frames, in stream order (see [`Gap`]). Filled gaps make the audio
     /// differ from what was encoded, so `md5_ok` is then `false`.
     pub gaps: Vec<Gap>,
+    /// The input ended in the middle of a frame (or Ogg page). As in libFLAC, the
+    /// audio up to the last complete frame is returned instead of failing;
+    /// `md5_ok` is then `false` if STREAMINFO carries an MD5.
+    pub truncated: bool,
 }
 
 /// A decoded VORBIS_COMMENT block: the vendor string and the user comments
@@ -152,8 +162,9 @@ pub(crate) fn parse_vorbis_comment(body: &[u8]) -> Option<DecodedVorbisComment> 
 /// (STREAMINFO, SEEKTABLE and VORBIS_COMMENT are interpreted, the rest skipped),
 /// then the audio frames, up to STREAMINFO's sample count when it is set. Verifies
 /// the audio MD5 against STREAMINFO when present. Missing frames are reported and
-/// filled as described at [`Gap`]. `None` on malformed input, a CRC mismatch, or a
-/// frame whose samples exceed its bit depth.
+/// filled as described at [`Gap`]. Input that ends in the middle of a frame ends
+/// the stream there ([`DecodedStream::truncated`]), as in libFLAC. `None` on
+/// malformed input, a CRC mismatch, or a frame whose samples exceed its bit depth.
 ///
 /// The whole stream is decoded into memory. For long streams or untrusted input,
 /// use [`StreamDecoder`] or [`decode_with`] with a sample limit.
@@ -200,6 +211,7 @@ fn collect(
         seek_points: header.seek_points.clone(),
         vorbis_comment: header.vorbis_comment.clone(),
         gaps: dec.gaps().to_vec(),
+        truncated: dec.truncated(),
     })
 }
 
@@ -405,6 +417,8 @@ pub struct SeekResult {
     pub sample_rate: u32,
     /// Missing frames after `first_sample`, in stream order (see [`Gap`]).
     pub gaps: Vec<Gap>,
+    /// The input ended in the middle of a frame, which was dropped.
+    pub truncated: bool,
 }
 
 /// The seek point to start decoding from for `target`: the non-placeholder point
@@ -453,8 +467,16 @@ pub fn decode_seek(data: &[u8], target_sample: u64) -> Option<SeekResult> {
     let mut fbr = BitReader::new(frames);
     let mut first_sample = None;
     let mut interleaved = Vec::new();
+    let mut truncated = false;
     while fbr.byte_pos() < frames.len() {
-        let frame = decode_frame(&mut fbr, Some(header.bits_per_sample))?;
+        let Some(frame) = decode_frame(&mut fbr, Some(&header)) else {
+            // A frame cut off by the end of the data ends the stream, as in libFLAC.
+            truncated = fbr.ran_out();
+            if truncated {
+                break;
+            }
+            return None;
+        };
         let start = timeline.place(&frame);
         match first_sample {
             None => {
@@ -495,6 +517,7 @@ pub fn decode_seek(data: &[u8], target_sample: u64) -> Option<SeekResult> {
         bits_per_sample: header.bits_per_sample,
         sample_rate: header.sample_rate,
         gaps: timeline.gaps,
+        truncated,
     })
 }
 
@@ -558,30 +581,45 @@ pub(crate) struct Frame {
     pub samples: Vec<Vec<i32>>,
 }
 
-/// Decode one frame. `stream_bps` is STREAMINFO's bit depth, for headers that
-/// defer to it (`None` for raw frames, where libFLAC then rejects such a frame as
-/// unparseable).
-pub(crate) fn decode_frame(br: &mut BitReader, stream_bps: Option<u32>) -> Option<Frame> {
+/// Decode one frame. `stream` is the STREAMINFO it belongs to (`None` for raw
+/// frames). The header is checked as libFLAC's `read_frame_header_` checks it
+/// (`stream_decoder.c:2735` ff.): reserved bits must be 0, the frame/sample
+/// number must be valid UTF-8, the block size at most 65535, and a bit depth
+/// deferred to STREAMINFO needs one. As in libFLAC, the number is a sample number
+/// also when STREAMINFO's minimum and maximum block sizes differ (old
+/// variable-block-size encoders set no flag).
+pub(crate) fn decode_frame(br: &mut BitReader, stream: Option<&StreamHeader>) -> Option<Frame> {
     let frame_start = br.byte_pos();
 
     // --- header ---
     if br.read_raw_u32(14)? != 0x3ffe {
         return None; // sync
     }
-    let _reserved = br.read_raw_u32(1)?;
+    let reserved = br.read_raw_u32(1)?;
     let blocking_strategy = br.read_raw_u32(1)?; // 0 = fixed, 1 = variable block size
     let bs_code = br.read_raw_u32(4)?;
     let sr_code = br.read_raw_u32(4)?;
     let ca_code = br.read_raw_u32(4)?;
     let bps_code = br.read_raw_u32(3)?;
-    let _reserved2 = br.read_raw_u32(1)?;
+    let reserved2 = br.read_raw_u32(1)?;
+    if reserved != 0 || reserved2 != 0 {
+        return None;
+    }
     // Fixed block size carries the frame number (UTF-8 u32); variable carries the
     // first sample number (UTF-8 u64). `Timeline::place` turns either into the
     // frame's position in the stream.
-    let number = if blocking_strategy == 0 {
-        FrameNumber::Frame(br.read_utf8_u32()?)
+    let variable =
+        blocking_strategy == 1 || stream.is_some_and(|s| s.min_blocksize != s.max_blocksize);
+    let number = if variable {
+        match br.read_utf8_u64()? {
+            u64::MAX => return None, // not UTF-8
+            n => FrameNumber::Sample(n),
+        }
     } else {
-        FrameNumber::Sample(br.read_utf8_u64()?)
+        match br.read_utf8_u32()? {
+            u32::MAX => return None, // not UTF-8
+            n => FrameNumber::Frame(n),
+        }
     };
 
     let blocksize = match bs_code {
@@ -591,7 +629,10 @@ pub(crate) fn decode_frame(br: &mut BitReader, stream_bps: Option<u32>) -> Optio
         4 => 2304,
         5 => 4608,
         6 => br.read_raw_u32(8)? as usize + 1,
-        7 => br.read_raw_u32(16)? as usize + 1,
+        7 => match br.read_raw_u32(16)? {
+            0xFFFF => return None, // 65536 exceeds the format's maximum
+            n => n as usize + 1,
+        },
         8 => 256,
         9 => 512,
         10 => 1024,
@@ -627,8 +668,8 @@ pub(crate) fn decode_frame(br: &mut BitReader, stream_bps: Option<u32>) -> Optio
         5 => 20,
         6 => 24,
         7 => 32,
-        0 => stream_bps?, // from STREAMINFO: any depth from 4 to 32
-        _ => return None, // 3 is reserved
+        0 => stream?.bits_per_sample, // from STREAMINFO: any depth from 4 to 32
+        _ => return None,             // 3 is reserved
     };
     let (assignment, channels) = match ca_code {
         0..=7 => (ChannelAssignment::Independent, ca_code + 1),
@@ -644,8 +685,8 @@ pub(crate) fn decode_frame(br: &mut BitReader, stream_bps: Option<u32>) -> Optio
         return None;
     }
 
-    // --- subframes (i64 channel data) ---
-    let mut chans: Vec<Vec<i64>> = Vec::with_capacity(channels as usize);
+    // --- subframes ---
+    let mut chans: Vec<Channel> = Vec::with_capacity(channels as usize);
     for ch in 0..channels {
         let side = matches!(
             (assignment, ch),
@@ -667,9 +708,12 @@ pub(crate) fn decode_frame(br: &mut BitReader, stream_bps: Option<u32>) -> Optio
     // libFLAC 1.5.0 rejects a frame whose samples do not fit its bit depth
     // (`ERROR_STATUS_OUT_OF_BOUNDS`, stream_decoder.c:2455), e.g. a side channel
     // that reconstructs a channel out of range.
-    let limit = 1i64 << (bits_per_sample - 1);
-    let samples = undecorrelate(assignment, &chans, blocksize);
-    if samples.iter().flatten().any(|&v| v < -limit || v >= limit) {
+    let samples = undecorrelate(assignment, chans, blocksize);
+    let (min, max) = (
+        i32::MIN >> (32 - bits_per_sample),
+        i32::MAX >> (32 - bits_per_sample),
+    );
+    if samples.iter().flatten().any(|&v| v < min || v > max) {
         return None;
     }
 
@@ -679,101 +723,163 @@ pub(crate) fn decode_frame(br: &mut BitReader, stream_bps: Option<u32>) -> Optio
         channels,
         bits_per_sample,
         sample_rate,
-        samples: samples
-            .into_iter()
-            .map(|c| c.into_iter().map(|v| v as i32).collect())
-            .collect(),
+        samples,
     })
 }
 
-/// Decode one subframe to its (wasted-bits-restored) `i64` channel signal.
+/// A decoded channel as libFLAC holds it: 32-bit (`output[]`), or 64-bit for the
+/// 33-bit side channel of a 32-bit stream (`side_subframe`).
+enum Channel {
+    Narrow(Vec<i32>),
+    Wide(Vec<i64>),
+}
+
+/// Decode one subframe of a `channel_bps`-bit channel (the frame's bit depth, plus
+/// one for a side channel), wasted bits restored.
 ///
-/// Malformed input is rejected with `None` where libFLAC drops the frame
-/// (`read_subframe_`, `stream_decoder.c:2967` ff.): wasted bits not below the
-/// channel's bit depth, a reserved FIXED order or LPC precision, a negative LPC
-/// shift, and the residual checks in [`decode_residual`]. Prediction arithmetic
-/// wraps instead of overflowing, as garbage that gets this far is caught by the
-/// frame CRC and the bit-depth check.
-fn decode_subframe(br: &mut BitReader, blocksize: usize, channel_bps: u32) -> Option<Vec<i64>> {
+/// The arithmetic is libFLAC's (`read_subframe_` and friends,
+/// `stream_decoder.c:2944` ff.), so even a corrupt frame with a valid CRC decodes
+/// to the same samples: 32-bit channels are restored in wrapping 32-bit
+/// arithmetic when libFLAC's bounds say 32 bits suffice, and otherwise in 64 bits
+/// truncated to 32; only the 33-bit side channel stays 64-bit. Malformed input is
+/// rejected with `None` where libFLAC drops the frame: a set padding bit, reserved
+/// subframe types, wasted bits not below the bit depth, a predictor order not below
+/// the block size, a reserved LPC precision or negative shift, and the residual
+/// checks in [`decode_residual`].
+fn decode_subframe(br: &mut BitReader, blocksize: usize, channel_bps: u32) -> Option<Channel> {
     let header = br.read_raw_u32(8)?;
     let wasted = if header & 1 == 1 {
         br.read_unary()?.checked_add(1)?
     } else {
         0
     };
-    if wasted >= channel_bps {
+    if header & 0x80 != 0 || wasted >= channel_bps {
         return None;
     }
-    let type6 = (header >> 1) & 0x3f;
-    let subframe_bps = channel_bps - wasted;
+    let bps = channel_bps - wasted;
+    let kind = (header >> 1) & 0x3f;
+    let order = match kind {
+        0 | 1 => 0,
+        0x08..=0x0C => (kind & 0x07) as usize,
+        0x20..=0x3F => ((kind & 0x1f) + 1) as usize,
+        _ => return None, // reserved
+    };
+    if kind >= 0x08 && blocksize <= order {
+        return None;
+    }
 
-    let mut data = vec![0i64; blocksize];
-    if type6 == 0 {
-        // CONSTANT
-        let v = br.read_signed(subframe_bps)?;
-        data.fill(v);
-    } else if type6 == 1 {
-        // VERBATIM
-        for d in data.iter_mut() {
-            *d = br.read_signed(subframe_bps)?;
-        }
-    } else if type6 & 0x20 != 0 {
-        // LPC, order = (type6 & 0x1f) + 1
-        let order = ((type6 & 0x1f) + 1) as usize;
-        for d in data.iter_mut().take(order) {
-            *d = br.read_signed(subframe_bps)?;
-        }
-        let precision = br.read_raw_u32(4)? + 1;
-        let shift = sign_extend5(br.read_raw_u32(5)?);
-        if precision == 16 || shift < 0 {
-            return None; // precision code 15 is reserved; the shift must be >= 0
-        }
-        let mut qlp = vec![0i32; order];
-        for c in qlp.iter_mut() {
-            *c = br.read_signed(precision)? as i32;
-        }
-        let residual = decode_residual(br, blocksize, order)?;
-        for i in order..blocksize {
-            let mut sum = 0i64;
-            for (j, &c) in qlp.iter().enumerate() {
-                sum = sum.wrapping_add((c as i64).wrapping_mul(data[i - 1 - j]));
+    // The 33-bit side channel (no wasted bits): libFLAC's `_33bit` paths, in i64.
+    if bps == 33 {
+        let mut data = vec![0i64; blocksize];
+        match kind {
+            0 => data.fill(br.read_signed(33)?),
+            1 => {
+                for d in data.iter_mut() {
+                    *d = br.read_signed(33)?;
+                }
             }
-            data[i] = (residual[i - order] as i64).wrapping_add(sum >> shift);
+            _ => {
+                for d in data.iter_mut().take(order) {
+                    *d = br.read_signed(33)?;
+                }
+                let (taps, shift) = if kind >= 0x20 {
+                    read_lpc_params(br, order)?
+                } else {
+                    (fixed_taps(order).to_vec(), 0)
+                };
+                let residual = decode_residual(br, blocksize, order)?;
+                for i in order..blocksize {
+                    let sum = taps.iter().enumerate().fold(0i64, |acc, (j, &c)| {
+                        acc.wrapping_add(i64::from(c).wrapping_mul(data[i - 1 - j]))
+                    });
+                    data[i] = i64::from(residual[i - order]).wrapping_add(sum >> shift);
+                }
+            }
         }
-    } else if type6 & 0x08 != 0 {
-        // FIXED, order = type6 & 0x07 (5..7 reserved)
-        let order = (type6 & 0x07) as usize;
-        if order > 4 {
-            return None;
-        }
-        for d in data.iter_mut().take(order) {
-            *d = br.read_signed(subframe_bps)?;
-        }
-        let residual = decode_residual(br, blocksize, order)?;
-        for i in order..blocksize {
-            let r = residual[i - order] as i64;
-            // The fixed predictors' coefficients, newest sample first.
-            let taps: &[i64] = match order {
-                0 => &[],
-                1 => &[1],
-                2 => &[2, -1],
-                3 => &[3, -3, 1],
-                _ => &[4, -6, 4, -1],
-            };
-            data[i] = taps.iter().enumerate().fold(r, |acc, (j, &t)| {
-                acc.wrapping_add(t.wrapping_mul(data[i - 1 - j]))
-            });
-        }
-    } else {
-        return None; // reserved subframe type
+        return Some(Channel::Wide(data));
     }
 
-    if wasted > 0 {
-        for d in data.iter_mut() {
-            *d <<= wasted;
+    let mut data = vec![0i32; blocksize];
+    match kind {
+        0 => data.fill(br.read_signed(bps)? as i32),
+        1 => {
+            for d in data.iter_mut() {
+                *d = br.read_signed(bps)? as i32;
+            }
+        }
+        _ => {
+            for d in data.iter_mut().take(order) {
+                *d = br.read_signed(bps)? as i32;
+            }
+            let (taps, shift, narrow) = if kind >= 0x20 {
+                let (qlp, shift) = read_lpc_params(br, order)?;
+                // `read_subframe_lpc_`: 32-bit when both bounds allow it.
+                let narrow = lpc::max_residual_bps(bps, &qlp, order, shift) <= 32
+                    && lpc::max_prediction_before_shift_bps(bps, &qlp, order) <= 32;
+                (qlp, shift, narrow)
+            } else {
+                // `read_subframe_fixed_`: 32-bit when bps + order <= 32.
+                (fixed_taps(order).to_vec(), 0, bps as usize + order <= 32)
+            };
+            let residual = decode_residual(br, blocksize, order)?;
+            for i in order..blocksize {
+                let r = residual[i - order];
+                data[i] = if narrow {
+                    let sum = taps.iter().enumerate().fold(0i32, |acc, (j, &c)| {
+                        acc.wrapping_add(c.wrapping_mul(data[i - 1 - j]))
+                    });
+                    r.wrapping_add(sum >> shift)
+                } else {
+                    let sum = taps.iter().enumerate().fold(0i64, |acc, (j, &c)| {
+                        acc.wrapping_add(i64::from(c).wrapping_mul(i64::from(data[i - 1 - j])))
+                    });
+                    (i64::from(r).wrapping_add(sum >> shift)) as i32
+                };
+            }
         }
     }
-    Some(data)
+
+    if wasted == 0 {
+        Some(Channel::Narrow(data))
+    } else if channel_bps < 33 {
+        Some(Channel::Narrow(
+            data.into_iter()
+                .map(|v| ((v as u32) << wasted) as i32)
+                .collect(),
+        ))
+    } else {
+        // A side channel of a 32-bit stream with wasted bits becomes 64-bit.
+        Some(Channel::Wide(
+            data.into_iter()
+                .map(|v| ((i64::from(v) as u64) << wasted) as i64)
+                .collect(),
+        ))
+    }
+}
+
+/// The fixed predictors' coefficients, newest sample first (`fixed.c`).
+fn fixed_taps(order: usize) -> &'static [i32] {
+    match order {
+        0 => &[],
+        1 => &[1],
+        2 => &[2, -1],
+        3 => &[3, -3, 1],
+        _ => &[4, -6, 4, -1],
+    }
+}
+
+/// An LPC subframe's precision, shift and quantized coefficients.
+fn read_lpc_params(br: &mut BitReader, order: usize) -> Option<(Vec<i32>, i32)> {
+    let precision = br.read_raw_u32(4)? + 1;
+    let shift = sign_extend5(br.read_raw_u32(5)?);
+    if precision == 16 || shift < 0 {
+        return None; // precision code 15 is reserved; the shift must be >= 0
+    }
+    let mut qlp = vec![0i32; order];
+    for c in qlp.iter_mut() {
+        *c = br.read_signed(precision)? as i32;
+    }
+    Some((qlp, shift))
 }
 
 /// Decode the partitioned-Rice residual (`blocksize - order` values). `None` for a
@@ -818,38 +924,62 @@ fn decode_residual(br: &mut BitReader, blocksize: usize, order: usize) -> Option
     Some(residual)
 }
 
-/// Reverse the stereo decorrelation back to independent channels, in `i64` so a
-/// result outside the bit depth can be detected rather than wrapped.
+/// Reverse the stereo decorrelation (`undo_channel_coding`,
+/// `stream_decoder.c`), in libFLAC's arithmetic: wrapping 32-bit, or 64-bit
+/// truncated to 32 when the 33-bit side channel is involved.
 fn undecorrelate(
     assignment: ChannelAssignment,
-    chans: &[Vec<i64>],
+    chans: Vec<Channel>,
     blocksize: usize,
-) -> Vec<Vec<i64>> {
+) -> Vec<Vec<i32>> {
+    let narrow = |c: Channel| match c {
+        Channel::Narrow(v) => v,
+        Channel::Wide(v) => v.into_iter().map(|x| x as i32).collect(),
+    };
+    let mut chans = chans.into_iter();
     match assignment {
-        ChannelAssignment::Independent => chans.to_vec(),
+        ChannelAssignment::Independent => chans.map(narrow).collect(),
         ChannelAssignment::LeftSide => {
-            // ch0 = left, ch1 = side = left - right -> right = left - side.
-            let (l, s) = (&chans[0], &chans[1]);
-            let right = (0..blocksize).map(|i| l[i].wrapping_sub(s[i])).collect();
-            vec![l.clone(), right]
+            let (left, side) = (narrow(chans.next().unwrap()), chans.next().unwrap());
+            let right = match side {
+                Channel::Narrow(s) => (0..blocksize).map(|i| left[i].wrapping_sub(s[i])).collect(),
+                Channel::Wide(s) => (0..blocksize)
+                    .map(|i| i64::from(left[i]).wrapping_sub(s[i]) as i32)
+                    .collect(),
+            };
+            vec![left, right]
         }
         ChannelAssignment::RightSide => {
-            // ch0 = side = left - right, ch1 = right -> left = right + side.
-            let (s, r) = (&chans[0], &chans[1]);
-            let left = (0..blocksize).map(|i| r[i].wrapping_add(s[i])).collect();
-            vec![left, r.clone()]
+            let (side, right) = (chans.next().unwrap(), narrow(chans.next().unwrap()));
+            let left = match side {
+                Channel::Narrow(s) => (0..blocksize)
+                    .map(|i| s[i].wrapping_add(right[i]))
+                    .collect(),
+                Channel::Wide(s) => (0..blocksize)
+                    .map(|i| i64::from(right[i]).wrapping_add(s[i]) as i32)
+                    .collect(),
+            };
+            vec![left, right]
         }
         ChannelAssignment::MidSide => {
-            // ch0 = mid = (L+R)>>1 (LSB dropped), ch1 = side = L-R. The dropped LSB
-            // equals side&1, so mid2 = (mid<<1)|(side&1) = L+R; L=(mid2+side)/2.
-            let (m, s) = (&chans[0], &chans[1]);
-            let mut left = vec![0i64; blocksize];
-            let mut right = vec![0i64; blocksize];
+            // mid = (L+R)>>1 dropped the LSB, which equals side&1; mid2 =
+            // (mid<<1)|(side&1) = L+R, so L = (mid2+side)>>1, R = (mid2-side)>>1.
+            let (mid, side) = (narrow(chans.next().unwrap()), chans.next().unwrap());
+            let mut left = vec![0i32; blocksize];
+            let mut right = vec![0i32; blocksize];
             for i in 0..blocksize {
-                let side = s[i];
-                let mid2 = (m[i] << 1) | (side & 1);
-                left[i] = mid2.wrapping_add(side) >> 1;
-                right[i] = mid2.wrapping_sub(side) >> 1;
+                match &side {
+                    Channel::Narrow(s) => {
+                        let mid2 = ((mid[i] as u32) << 1) as i32 | (s[i] & 1);
+                        left[i] = mid2.wrapping_add(s[i]) >> 1;
+                        right[i] = mid2.wrapping_sub(s[i]) >> 1;
+                    }
+                    Channel::Wide(s) => {
+                        let mid2 = ((i64::from(mid[i]) as u64) << 1) as i64 | (s[i] & 1);
+                        left[i] = (mid2.wrapping_add(s[i]) >> 1) as i32;
+                        right[i] = (mid2.wrapping_sub(s[i]) >> 1) as i32;
+                    }
+                }
             }
             vec![left, right]
         }

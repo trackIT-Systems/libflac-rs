@@ -15,7 +15,9 @@ mod residual;
 pub use autocorr::compute_autocorrelation;
 pub use levinson::{LpCoefficients, compute_best_order, compute_lp_coefficients, expected_bits};
 pub use quantize::quantize_coefficients;
-pub use residual::{compute_residual, compute_residual_limit, max_residual_bps};
+pub use residual::{
+    compute_residual, compute_residual_limit, max_prediction_before_shift_bps, max_residual_bps,
+};
 
 /// Maximum LPC order (`FLAC__MAX_LPC_ORDER`); the Levinson coefficient rows and
 /// the predictor history are sized to this.

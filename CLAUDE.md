@@ -271,7 +271,11 @@ residual/rice → CRC-16 — diffing at the first mismatching field.
   frame (`OUT_OF_BOUNDS`, `:2455`); `decode_ogg` takes the first FLAC logical
   stream and `decode_ogg_chained` every link (`ogg::read_flac_streams`). Checked
   against libFLAC's decoder in `oracle/tests/decoder.rs`. Corrupt frames still fail
-  the decode (libFLAC resynchronizes).
+  the decode (libFLAC resynchronizes). Sample reconstruction mirrors libFLAC's
+  integer widths (`Channel::Narrow` = its `int32` paths, wrapping; `Wide` = the
+  33-bit side channel) so damaged-but-CRC-valid frames match it; truncated input
+  ends the stream (`truncated`), as in libFLAC. The `fuzz/` crate's `diff_decode`
+  target finds remaining differences.
 - **O1 — Ogg FLAC DONE (byte-exact).** `ogg.rs` ports libogg 1.3.5 paging
   (`framing.c`) + the FLAC-in-Ogg mapping (`ogg_encoder_aspect.c`).
   `encoder::encode_ogg` is **byte-identical to libFLAC+libogg** and

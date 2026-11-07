@@ -259,10 +259,72 @@ fn reports_io_and_format_errors() {
         Err(DecodeError::Malformed)
     ));
 
-    let flac = Encoder::new(EncoderConfig::new(1, 16, 44_100)).encode(&pcm(1, 9_000, 7));
-    let truncated = &flac[..flac.len() - 10];
-    let mut dec = StreamDecoder::new(trickle(truncated)).unwrap();
+    // Garbage that is not a truncation still fails.
+    let input = pcm(1, 9_000, 7);
+    let mut flac =
+        Encoder::new(EncoderConfig::new(1, 16, 44_100).with_block_size(1000)).encode(&input);
+    let end = flac.len();
+    flac[end - 20] ^= 0xFF;
+    let mut dec = StreamDecoder::new(&flac[..]).unwrap();
     let results: Vec<_> = dec.by_ref().collect();
     assert!(matches!(results.last(), Some(Err(DecodeError::Malformed))));
     assert!(dec.next().is_none());
+}
+
+/// Input that ends mid-frame ends the stream after the last complete frame, as
+/// libFLAC does; `truncated` tells, and the MD5 check fails.
+#[test]
+fn truncated_input_ends_after_the_last_complete_frame() {
+    let input = pcm(1, 9_000, 7);
+    let enc = Encoder::new(EncoderConfig::new(1, 16, 44_100).with_block_size(1000));
+    let flac = enc.encode(&input);
+    let cut = &flac[..flac.len() - 10]; // into the last (short) frame
+    let mut dec = StreamDecoder::new(trickle(cut)).unwrap();
+    assert_eq!(blocks(&mut dec), input[..8_000]);
+    assert!(dec.truncated());
+    assert_eq!(dec.md5_ok(), Some(false));
+
+    let decoded = decode(cut).unwrap();
+    assert_eq!(decoded.interleaved, input[..8_000]);
+    assert!(decoded.truncated && !decoded.md5_ok);
+    let seek = libflac_rs::decode_seek(cut, 2_500).unwrap();
+    assert_eq!(seek.interleaved, input[2_500..8_000]);
+    assert!(seek.truncated);
+    let raw = enc.encode_frames(&input);
+    let frames = decode_frames(&raw[..raw.len() - 3]).unwrap();
+    assert!(frames.truncated && frames.interleaved == input[..8_000]);
+
+    // Complete input is not truncated.
+    let mut dec = StreamDecoder::new(&flac[..]).unwrap();
+    blocks(&mut dec);
+    assert!(!dec.truncated());
+}
+
+/// Ogg: a page cut off at the end ends the stream; junk or a damaged page
+/// between pages is skipped up to the next page, as libogg does.
+#[test]
+fn ogg_truncation_and_junk_are_tolerated() {
+    let input = pcm(2, 6_000, 8);
+    let ogg =
+        Encoder::new(EncoderConfig::new(2, 16, 44_100).with_block_size(512)).encode_ogg(&input, 4);
+
+    let cut = &ogg[..ogg.len() - 7];
+    let mut dec = StreamDecoder::new(trickle(cut)).unwrap();
+    let decoded = blocks(&mut dec);
+    assert!(dec.truncated());
+    assert!(input.starts_with(&decoded) && decoded.len() < input.len());
+
+    // Junk between pages (after the first) and a page with a bad CRC are skipped.
+    let first = 27
+        + ogg[26] as usize
+        + ogg[27..27 + ogg[26] as usize]
+            .iter()
+            .map(|&b| b as usize)
+            .sum::<usize>();
+    let mut bad_page = ogg[..first].to_vec();
+    bad_page[first - 1] ^= 1; // a copy of the first page with a bad CRC
+    let wrapped = [&ogg[..first], b"junk OggX", &bad_page, &ogg[first..]].concat();
+    let mut dec = StreamDecoder::new(&wrapped[..]).unwrap();
+    assert_eq!(blocks(&mut dec), input);
+    assert!(!dec.truncated());
 }

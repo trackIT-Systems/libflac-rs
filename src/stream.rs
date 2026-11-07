@@ -230,6 +230,8 @@ pub struct StreamDecoder<R> {
     first_frame: Option<Frame>,
     /// The current link has ended.
     done: bool,
+    /// The input ended in the middle of a frame or Ogg page.
+    truncated: bool,
 }
 
 impl<R: Read> StreamDecoder<R> {
@@ -246,14 +248,17 @@ impl<R: Read> StreamDecoder<R> {
         }
         let head = &input.available()[..4];
         let mut first_frame = None;
+        let mut truncated = false;
         let (container, header) = if head == b"fLaC" {
             input.consume(4);
             (Container::Native, read_native_header(&mut input)?)
         } else if head == b"OggS" {
-            let (link, header) = find_ogg_link(&mut input)?.ok_or(DecodeError::Malformed)?;
+            let (link, header) =
+                find_ogg_link(&mut input, &mut truncated)?.ok_or(DecodeError::Malformed)?;
             (Container::Ogg(link), header)
         } else if head[0] == 0xFF && head[1] & 0xFE == 0xF8 {
-            let frame = read_frame(&mut input, None)?.ok_or(DecodeError::Malformed)?;
+            let frame =
+                read_frame(&mut input, None, &mut truncated)?.ok_or(DecodeError::Malformed)?;
             let header = StreamHeader {
                 channels: frame.channels,
                 bits_per_sample: frame.bits_per_sample,
@@ -281,6 +286,7 @@ impl<R: Read> StreamDecoder<R> {
             pending: VecDeque::new(),
             first_frame,
             done: false,
+            truncated,
         };
         decoder.start_link();
         Ok(decoder)
@@ -300,6 +306,13 @@ impl<R: Read> StreamDecoder<R> {
     /// ended: `Some(true)` also when there is no MD5 to check. `None` before.
     pub fn md5_ok(&self) -> Option<bool> {
         self.md5_ok
+    }
+
+    /// Whether the input ended in the middle of a frame or Ogg page. Like libFLAC,
+    /// the decoder then ends the stream after the last complete frame instead of
+    /// failing; this tells the two apart (the MD5 check also fails then).
+    pub fn truncated(&self) -> bool {
+        self.truncated
     }
 
     /// The next block of audio, `Ok(None)` at the end of the stream (or of the
@@ -368,11 +381,11 @@ impl<R: Read> StreamDecoder<R> {
         };
         // Skip to the end of the current link.
         while !link.ended {
-            if !read_ogg_page(&mut self.input, link)? {
+            if !read_ogg_page(&mut self.input, link, &mut self.truncated)? {
                 break;
             }
         }
-        match find_ogg_link(&mut self.input)? {
+        match find_ogg_link(&mut self.input, &mut self.truncated)? {
             Some((next, header)) => {
                 self.container = Container::Ogg(next);
                 self.header = header;
@@ -392,6 +405,7 @@ impl<R: Read> StreamDecoder<R> {
         self.emitted = 0;
         self.pending.clear();
         self.done = false;
+        self.truncated = false;
     }
 
     /// Queue a block, truncated at STREAMINFO's sample count (when set), feeding
@@ -437,18 +451,18 @@ impl<R: Read> StreamDecoder<R> {
 
     /// The next frame of the current stream or link, `None` at its end.
     fn next_frame(&mut self) -> Result<Option<Frame>, DecodeError> {
-        let stream_bps = Some(self.header.bits_per_sample);
+        let header = Some(&self.header);
         match &mut self.container {
-            Container::Native => read_frame(&mut self.input, stream_bps),
-            Container::Raw => read_frame(&mut self.input, None),
+            Container::Native => read_frame(&mut self.input, header, &mut self.truncated),
+            Container::Raw => read_frame(&mut self.input, None, &mut self.truncated),
             Container::Ogg(link) => loop {
                 if let Some(packet) = link.packets.pop_front() {
                     let mut br = BitReader::new(&packet);
-                    return decode_frame(&mut br, stream_bps)
+                    return decode_frame(&mut br, header)
                         .map(Some)
                         .ok_or(DecodeError::Malformed);
                 }
-                if link.ended || !read_ogg_page(&mut self.input, link)? {
+                if link.ended || !read_ogg_page(&mut self.input, link, &mut self.truncated)? {
                     return Ok(None);
                 }
             },
@@ -511,10 +525,14 @@ fn read_native_header<R: Read>(input: &mut Input<R>) -> Result<StreamHeader, Dec
     Ok(header)
 }
 
-/// The next frame from a native/raw stream, `None` at the end of the input.
+/// The next frame from a native/raw stream, `None` at the end of the input. A
+/// frame cut off by the end of the input also ends it, as in libFLAC (which
+/// treats running out of data mid-frame as the end of the stream); `truncated` is
+/// then set.
 fn read_frame<R: Read>(
     input: &mut Input<R>,
-    stream_bps: Option<u32>,
+    stream: Option<&StreamHeader>,
+    truncated: &mut bool,
 ) -> Result<Option<Frame>, DecodeError> {
     loop {
         let avail = input.available();
@@ -526,54 +544,109 @@ fn read_frame<R: Read>(
             continue;
         }
         let mut br = BitReader::new(avail);
-        if let Some(frame) = decode_frame(&mut br, stream_bps) {
+        if let Some(frame) = decode_frame(&mut br, stream) {
             let used = br.byte_pos();
             input.consume(used);
             return Ok(Some(frame));
         }
         // Truncated rather than invalid: read more and retry, doubling the buffer.
-        if !br.ran_out() || input.eof || avail.len() >= MAX_FRAME_BYTES {
+        if !br.ran_out() || avail.len() >= MAX_FRAME_BYTES {
             return Err(DecodeError::Malformed);
+        }
+        if input.eof {
+            let rest = avail.len();
+            input.consume(rest);
+            *truncated = true;
+            return Ok(None);
         }
         let more = avail.len();
         input.read_more(more)?;
     }
 }
 
-/// Read one Ogg page; packets of `link`'s logical stream are queued, other pages
-/// skipped. `false` at the end of the input.
-fn read_ogg_page<R: Read>(input: &mut Input<R>, link: &mut OggLink) -> Result<bool, DecodeError> {
+/// An Ogg page copied out of the input.
+struct OwnedPage {
+    flags: u8,
+    serial: u32,
+    lacing: Vec<u8>,
+    body: Vec<u8>,
+}
+
+/// The next valid Ogg page, `None` at the end of the input. Like libogg's
+/// `ogg_sync_pageseek`, bytes that do not start a valid page (junk, or a page with
+/// a bad CRC) are skipped up to the next `OggS` capture pattern; a page cut off by
+/// the end of the input ends it and sets `truncated`.
+fn next_page<R: Read>(
+    input: &mut Input<R>,
+    truncated: &mut bool,
+) -> Result<Option<OwnedPage>, DecodeError> {
     loop {
-        if input.available().is_empty() && input.fill(1).map(|got| !got)? {
-            return Ok(false);
+        if input.available().is_empty() && !input.fill(1)? {
+            return Ok(None);
         }
-        match ogg::parse_page(input.available()).ok_or(DecodeError::Malformed)? {
-            PageParse::NeedMore(n) => {
+        match ogg::parse_page(input.available()) {
+            Some(PageParse::Page(page, len)) => {
+                let owned = OwnedPage {
+                    flags: page.flags,
+                    serial: page.serial,
+                    lacing: page.lacing.to_vec(),
+                    body: page.body.to_vec(),
+                };
+                input.consume(len);
+                return Ok(Some(owned));
+            }
+            Some(PageParse::NeedMore(n)) => {
                 if !input.fill(n)? {
-                    return Err(DecodeError::Malformed);
+                    let rest = input.available().len();
+                    input.consume(rest);
+                    *truncated = true;
+                    return Ok(None);
                 }
             }
-            PageParse::Page(page, len) => {
-                if page.serial == link.serial && !link.ended {
-                    let mut off = 0;
-                    for &lv in page.lacing {
-                        let lv = lv as usize;
-                        link.partial.extend_from_slice(&page.body[off..off + lv]);
-                        off += lv;
-                        if link.partial.len() > MAX_FRAME_BYTES {
-                            return Err(DecodeError::Malformed);
-                        }
-                        if lv < 255 {
-                            link.packets.push_back(std::mem::take(&mut link.partial));
+            None => {
+                // Resynchronize after the current byte.
+                let avail = input.available();
+                match avail[1..].windows(4).position(|w| w == b"OggS") {
+                    Some(i) => input.consume(1 + i),
+                    None => {
+                        let skip = avail.len().saturating_sub(3).max(1);
+                        input.consume(skip);
+                        if !input.eof {
+                            input.read_more(1)?;
                         }
                     }
-                    link.ended = page.flags & 0x04 != 0;
                 }
-                input.consume(len);
-                return Ok(true);
             }
         }
     }
+}
+
+/// Read one Ogg page; packets of `link`'s logical stream are queued, other pages
+/// skipped. `false` at the end of the input.
+fn read_ogg_page<R: Read>(
+    input: &mut Input<R>,
+    link: &mut OggLink,
+    truncated: &mut bool,
+) -> Result<bool, DecodeError> {
+    let Some(page) = next_page(input, truncated)? else {
+        return Ok(false);
+    };
+    if page.serial == link.serial && !link.ended {
+        let mut off = 0;
+        for &lv in &page.lacing {
+            let lv = lv as usize;
+            link.partial.extend_from_slice(&page.body[off..off + lv]);
+            off += lv;
+            if link.partial.len() > MAX_FRAME_BYTES {
+                return Err(DecodeError::Malformed);
+            }
+            if lv < 255 {
+                link.packets.push_back(std::mem::take(&mut link.partial));
+            }
+        }
+        link.ended = page.flags & 0x04 != 0;
+    }
+    Ok(true)
 }
 
 /// Find the next FLAC logical stream (a BOS page with the `0x7F"FLAC"` mapping
@@ -581,39 +654,41 @@ fn read_ogg_page<R: Read>(input: &mut Input<R>, link: &mut OggLink) -> Result<bo
 /// the metadata packets up to the first frame. `None` if the input ends first.
 fn find_ogg_link<R: Read>(
     input: &mut Input<R>,
+    truncated: &mut bool,
 ) -> Result<Option<(OggLink, StreamHeader)>, DecodeError> {
-    let serial = loop {
-        if input.available().is_empty() && !input.fill(1)? {
-            return Ok(None);
-        }
-        let page = ogg::parse_page(input.available()).ok_or(DecodeError::Malformed)?;
-        match page {
-            PageParse::NeedMore(n) => {
-                if !input.fill(n)? {
-                    return Err(DecodeError::Malformed);
-                }
+    let first = loop {
+        match next_page(input, truncated)? {
+            None => return Ok(None),
+            Some(page) if page.flags & 0x02 != 0 && page.body.starts_with(b"\x7FFLAC") => {
+                break page;
             }
-            PageParse::Page(page, len) => {
-                if page.flags & 0x02 != 0 && page.body.starts_with(b"\x7FFLAC") {
-                    break page.serial; // parsed again below, as part of the link
-                }
-                input.consume(len);
-            }
+            Some(_) => {}
         }
     };
     let mut link = OggLink {
-        serial,
+        serial: first.serial,
         partial: Vec::new(),
         packets: VecDeque::new(),
         ended: false,
     };
+    // The BOS page's packets.
+    let mut off = 0;
+    for &lv in &first.lacing {
+        let lv = lv as usize;
+        link.partial.extend_from_slice(&first.body[off..off + lv]);
+        off += lv;
+        if lv < 255 {
+            link.packets.push_back(std::mem::take(&mut link.partial));
+        }
+    }
+    link.ended = first.flags & 0x04 != 0;
     // The mapping packet: 0x7F "FLAC" major minor header-count(2) "fLaC"
     // STREAMINFO-block-header(4) STREAMINFO(34).
     let mapping = loop {
         if let Some(p) = link.packets.pop_front() {
             break p;
         }
-        if !read_ogg_page(input, &mut link)? {
+        if !read_ogg_page(input, &mut link, truncated)? {
             return Err(DecodeError::Malformed);
         }
     };
@@ -636,7 +711,7 @@ fn find_ogg_link<R: Read>(
                 }
             }
             None => {
-                if link.ended || !read_ogg_page(input, &mut link)? {
+                if link.ended || !read_ogg_page(input, &mut link, truncated)? {
                     break; // a link without audio
                 }
             }

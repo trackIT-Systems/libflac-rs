@@ -380,6 +380,22 @@ pub fn try_encode_with_metadata(
     try_run(config, MODE_STREAM, 0, interleaved, Some(blocks))
 }
 
+/// [`encode_frames`], returning libFLAC's rejection instead of panicking (see
+/// [`try_encode_with_metadata`]).
+pub fn try_encode_frames(config: &EncoderConfig, interleaved: &[i32]) -> Result<Vec<u8>, i32> {
+    try_run(config, MODE_FRAMES, 0, interleaved, None)
+}
+
+/// [`encode_ogg`], returning libFLAC's rejection instead of panicking (see
+/// [`try_encode_with_metadata`]).
+pub fn try_encode_ogg(
+    config: &EncoderConfig,
+    interleaved: &[i32],
+    serial: i32,
+) -> Result<Vec<u8>, i32> {
+    try_run(config, MODE_OGG, serial, interleaved, None)
+}
+
 /// A complete Ogg FLAC stream with libFLAC's default metadata and the given Ogg
 /// `serial`. Mirrors [`libflac_rs::Encoder::encode_ogg`].
 pub fn encode_ogg(config: &EncoderConfig, interleaved: &[i32], serial: i32) -> Vec<u8> {
