@@ -18,8 +18,23 @@ bit-exact with, the patch counts our own changes against it.
   file can otherwise legitimately expand to gigabytes (measured: 36 bytes per
   2 MiB of silence, 72 bytes to 84 MB through a filled gap).
 
+- Encoder input validation (`EncodeError`): `Encoder::try_new` and
+  `try_encode`, `try_encode_frames`, `try_encode_with_metadata`, `try_encode_ogg`
+  reject what libFLAC rejects — channels outside 1–8, bit depths outside 4–32,
+  sample rates above 1 048 575 Hz, block sizes outside 16–65535, samples that do
+  not fit the bit depth, input not a whole number of samples per channel, and
+  metadata libFLAC's `init` refuses (duplicate SEEKTABLE or VORBIS_COMMENT,
+  unsorted seek points, illegal cue sheets or pictures) or the format cannot hold
+  (blocks of 16 MiB or more, more than 255 cue sheet tracks or index points,
+  Vorbis comments that are not `NAME=value`).
+- Every bit depth from 4 to 32, in the encoder (byte-identical to libFLAC) and the
+  decoder.
+
 ### Changed
 
+- `Encoder::new` and the `encode*` methods panic with the `EncodeError` on
+  invalid settings or input. Before, they wrote a corrupt stream or decoded to
+  different samples without notice.
 - Decoding stops at STREAMINFO's sample count when it is set: data after the
   declared end is no longer read (before, it was decoded and then discarded, and
   trailing garbage made decoding fail).
@@ -27,6 +42,14 @@ bit-exact with, the patch counts our own changes against it.
 
 ### Fixed
 
+- Samples outside the bit depth were encoded without error and decoded to
+  different values; metadata blocks of 16 MiB or more overflowed their length
+  field and corrupted the stream. Both are now rejected.
+- The decoder rejected valid FLAC at bit depths other than 8/12/16/20/24/32 (frame
+  headers that defer the depth to STREAMINFO), e.g. libFLAC's 18- or 28-bit
+  output.
+- A total sample count beyond STREAMINFO's 36 bits is written as 0 ("unknown"),
+  as in libFLAC.
 - The decoder no longer panics on malformed input. It now rejects what libFLAC
   rejects (wasted bits not below the bit depth, residual partitions smaller than
   the predictor order or not dividing the block, reserved coding methods, FIXED

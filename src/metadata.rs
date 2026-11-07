@@ -325,7 +325,14 @@ pub fn write_streaminfo(bw: &mut BitWriter, si: &StreamInfo, is_last: bool) {
     bw.write_raw_u32(si.sample_rate, 20);
     bw.write_raw_u32(si.channels - 1, 3);
     bw.write_raw_u32(si.bits_per_sample - 1, 5);
-    bw.write_raw_u64(si.total_samples, 36);
+    // A count that does not fit 36 bits is written as 0, "unknown"
+    // (`stream_encoder.c:3189`).
+    let total_samples = if si.total_samples >> 36 != 0 {
+        0
+    } else {
+        si.total_samples
+    };
+    bw.write_raw_u64(total_samples, 36);
     bw.write_byte_block(&si.md5);
 }
 

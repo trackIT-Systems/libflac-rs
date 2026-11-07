@@ -447,3 +447,236 @@ fn default_block_size() {
     }
     failures.assert_none();
 }
+
+/// Every bit depth the format allows (4–32), not just those with their own
+/// frame-header code: frames, streams and Ogg, mono and stereo.
+#[test]
+fn every_bit_depth() {
+    let mut failures = Failures::default();
+    for bps in 4..=32 {
+        for channels in [1, 2] {
+            let pcm = signal(channels, bps, 4096, 3, u64::from(bps * 7 + channels));
+            for level in [0, 5, 8] {
+                let cfg = EncoderConfig::new(channels, bps, 44_100).with_compression_level(level);
+                let enc = Encoder::new(cfg);
+                let label = format!("{bps}-bit {channels}ch level {level}");
+                failures.check(
+                    format_args!("{label} frames"),
+                    &enc.encode_frames(&pcm),
+                    &oracle::encode_frames(&cfg, &pcm),
+                );
+                failures.check(
+                    format_args!("{label} stream"),
+                    &enc.encode(&pcm),
+                    &oracle::encode(&cfg, &pcm),
+                );
+                failures.check(
+                    format_args!("{label} ogg"),
+                    &enc.encode_ogg(&pcm, 5),
+                    &oracle::encode_ogg(&cfg, &pcm, 5),
+                );
+            }
+        }
+    }
+    failures.assert_none();
+}
+
+/// The encoder rejects what libFLAC rejects (settings, samples, metadata) and
+/// accepts what it accepts, with identical bytes. libFLAC's field-width limits
+/// (a 16 MiB block, 256 cue sheet tracks) fail in its bit writer, which refuses a
+/// value wider than its field (`bitwriter.c:357`). One rule is the format's
+/// rather than libFLAC's: Vorbis comments that are not `NAME=value`, which
+/// libFLAC does not check; only the Rust encoder rejects those.
+#[test]
+fn validation_matches_libflac() {
+    use libflac_rs::{CueSheetIndex, CueSheetTrack, SeekPoint};
+    const VC: MetadataBlock = MetadataBlock::VorbisComment(LIBFLAC_VENDOR_STRING);
+    let point = |sample_number| SeekPoint {
+        sample_number,
+        stream_offset: 0,
+        frame_samples: 0,
+    };
+    let unsorted = [point(4096), point(0)];
+    let indices = [CueSheetIndex {
+        offset: 0,
+        number: 1,
+    }];
+    let tracks: Vec<CueSheetTrack> = (0..256)
+        .map(|i| CueSheetTrack {
+            offset: i,
+            number: (i % 250 + 1) as u8,
+            isrc: [0; 12],
+            non_audio: false,
+            pre_emphasis: false,
+            indices: &indices,
+        })
+        .collect();
+    let mcn = [0u8; 128];
+    let big = vec![0u8; 1 << 24];
+    let bad_entry = ["not a comment"];
+
+    let pcm16 =
+        |n: usize| -> Vec<i32> { (0..n as i32).map(|i| (i * 37) % 30_000 - 15_000).collect() };
+    let cfg = |ch, bps, rate, block| EncoderConfig::new(ch, bps, rate).with_block_size(block);
+    // (label, settings, samples, metadata, rejected, libFLAC has the rule)
+    #[allow(clippy::type_complexity)]
+    let cases: Vec<(
+        &str,
+        EncoderConfig,
+        Vec<i32>,
+        Vec<MetadataBlock>,
+        bool,
+        bool,
+    )> = vec![
+        (
+            "1 channel, 4-bit, rate 0, block 16",
+            cfg(1, 4, 0, 16),
+            [-8, 7, 0, 3].repeat(40),
+            vec![VC],
+            false,
+            true,
+        ),
+        (
+            "8 channels, 32-bit, max rate, block 65535",
+            cfg(8, 32, 1_048_575, 65_535),
+            [i32::MIN, i32::MAX, 0, 1, -1, 5, 6, 7].repeat(9),
+            vec![VC],
+            false,
+            true,
+        ),
+        (
+            "9 channels",
+            cfg(9, 16, 44_100, 0),
+            vec![0; 9],
+            vec![VC],
+            true,
+            true,
+        ),
+        (
+            "3 bits",
+            cfg(1, 3, 44_100, 0),
+            vec![0],
+            vec![VC],
+            true,
+            true,
+        ),
+        (
+            "33 bits",
+            cfg(1, 33, 44_100, 0),
+            vec![0],
+            vec![VC],
+            true,
+            true,
+        ),
+        (
+            "rate 1048576",
+            cfg(1, 16, 1_048_576, 0),
+            vec![0],
+            vec![VC],
+            true,
+            true,
+        ),
+        (
+            "block 15",
+            cfg(1, 16, 44_100, 15),
+            vec![0],
+            vec![VC],
+            true,
+            true,
+        ),
+        (
+            "16-bit sample 32768",
+            cfg(1, 16, 44_100, 0),
+            [pcm16(500), vec![32_768]].concat(),
+            vec![VC],
+            true,
+            true,
+        ),
+        (
+            "16-bit sample -32769",
+            cfg(1, 16, 44_100, 0),
+            vec![-32_769],
+            vec![VC],
+            true,
+            true,
+        ),
+        (
+            "4-bit sample 8",
+            cfg(1, 4, 44_100, 0),
+            vec![8],
+            vec![VC],
+            true,
+            true,
+        ),
+        (
+            "unsorted seek table",
+            cfg(1, 16, 44_100, 0),
+            pcm16(9000),
+            vec![VC, MetadataBlock::Seektable(&unsorted)],
+            true,
+            true,
+        ),
+        (
+            "two VORBIS_COMMENTs",
+            cfg(1, 16, 44_100, 0),
+            pcm16(100),
+            vec![VC, VC],
+            true,
+            true,
+        ),
+        (
+            "16 MiB APPLICATION",
+            cfg(1, 16, 44_100, 0),
+            pcm16(100),
+            vec![
+                VC,
+                MetadataBlock::Application {
+                    id: *b"test",
+                    data: &big,
+                },
+            ],
+            true,
+            true,
+        ),
+        (
+            "256 cue sheet tracks",
+            cfg(1, 16, 44_100, 0),
+            pcm16(100),
+            vec![
+                VC,
+                MetadataBlock::CueSheet {
+                    media_catalog_number: &mcn,
+                    lead_in: 0,
+                    is_cd: false,
+                    tracks: &tracks,
+                },
+            ],
+            true,
+            true,
+        ),
+        (
+            "comment without '='",
+            cfg(1, 16, 44_100, 0),
+            pcm16(100),
+            vec![MetadataBlock::VorbisCommentEntries {
+                vendor: LIBFLAC_VENDOR_STRING,
+                comments: &bad_entry,
+            }],
+            true,
+            false,
+        ),
+    ];
+    for (label, config, pcm, blocks, rejected, libflac_rule) in &cases {
+        let rust = Encoder::try_new(*config).and_then(|e| e.try_encode_with_metadata(pcm, blocks));
+        let c = oracle::try_encode_with_metadata(config, pcm, blocks);
+        assert_eq!(rust.is_err(), *rejected, "{label}: Rust {rust:?}");
+        if *libflac_rule {
+            assert_eq!(c.is_err(), *rejected, "{label}: libFLAC {c:?}");
+        } else {
+            assert!(c.is_ok(), "{label}: libFLAC was expected to accept it");
+        }
+        if !rejected {
+            assert_eq!(rust.unwrap(), c.unwrap(), "{label}: bytes differ");
+        }
+    }
+}

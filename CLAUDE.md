@@ -237,7 +237,8 @@ residual/rice → CRC-16 — diffing at the first mismatching field.
   trackIT-Systems fork; tagged streams at 192/384/500 kHz, levels 0/5/8, are
   byte-identical to libFLAC 1.5.0 apart from the vendor string. The decoder returns
   the block as `DecodedStream::vorbis_comment` (native and Ogg).
-- **G3 — DONE (all bit depths 8/12/16/20/24/32).** RICE2 (5-bit params, escape 31)
+- **G3 — DONE (all bit depths 8/12/16/20/24/32; later every depth 4–32, whose
+  frame headers defer to STREAMINFO, byte-exact without further changes).** RICE2 (5-bit params, escape 31)
   is selected per partition when any rice parameter reaches 15
   (`RicePartition::is_rice2`), driven by the `bps>16 ? 31 : 15` rice-parameter
   limit. **32-bit** carries the channel signal as `i64` throughout (so the 33-bit
@@ -297,6 +298,11 @@ residual/rice → CRC-16 — diffing at the first mismatching field.
 - Faithful transcription over "improved" Rust when bit-exactness is at stake;
   idiomatic refactors are fine only for plumbing that cannot affect output bytes.
 - Keep `*.c:NNN` citations in module docs accurate when you touch the code.
+- Input validation lives in `validate.rs`: settings (`init_stream_internal_`),
+  samples (`process_interleaved`'s range check) and metadata (`init`'s checks plus
+  field widths) are rejected where libFLAC rejects them, nothing stricter except
+  Vorbis comment entries (the format's rule); `oracle/tests/differential.rs`
+  `validation_matches_libflac` pins this down.
 - Transcendentals (`f32::cos`, `f64::ln`) go through the platform libm, like
   libFLAC's: output matches libFLAC built on the same platform and may differ
   between glibc, musl and macOS (decided 2026-11-06; measurements in `ORACLE.md`).

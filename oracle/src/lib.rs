@@ -281,9 +281,22 @@ fn run(
     interleaved: &[i32],
     blocks: Option<&[MetadataBlock]>,
 ) -> Vec<u8> {
+    try_run(config, mode, serial, interleaved, blocks)
+        .unwrap_or_else(|rc| panic!("libFLAC encode failed (shim code {rc})"))
+}
+
+/// Encode with libFLAC; `Err` with the shim's negative code when libFLAC rejects
+/// the settings (`-100 - init status`) or the samples (`-200 - state`).
+fn try_run(
+    config: &EncoderConfig,
+    mode: u32,
+    serial: i32,
+    interleaved: &[i32],
+    blocks: Option<&[MetadataBlock]>,
+) -> Result<Vec<u8>, i32> {
     let channels = config.channels as usize;
     assert!(
-        channels > 0 && interleaved.len() % channels == 0,
+        channels == 0 || interleaved.len() % channels == 0,
         "ragged interleave"
     );
     let cfg = Config {
@@ -312,22 +325,24 @@ fn run(
         libflac_rs_oracle_encode(
             &cfg,
             interleaved.as_ptr(),
-            len32(interleaved.len() / channels),
+            len32(interleaved.len().checked_div(channels).unwrap_or(0)),
             c_blocks.as_ptr(),
             num_blocks,
             &mut out,
             &mut out_len,
         )
     };
-    assert_eq!(rc, 0, "libFLAC encode failed (shim code {rc})");
+    if rc != 0 {
+        return Err(rc);
+    }
     if out.is_null() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     // SAFETY: on success `out` holds `out_len` initialized bytes owned by us.
     let bytes = unsafe { std::slice::from_raw_parts(out, out_len) }.to_vec();
     unsafe { libflac_rs_oracle_free(out) };
     drop(keep);
-    bytes
+    Ok(bytes)
 }
 
 /// libFLAC's raw audio frames (marker and metadata dropped, as CHD stores them).
@@ -351,6 +366,18 @@ pub fn encode_with_metadata(
     blocks: &[MetadataBlock],
 ) -> Vec<u8> {
     run(config, MODE_STREAM, 0, interleaved, Some(blocks))
+}
+
+/// [`encode_with_metadata`], returning libFLAC's rejection (the shim's negative
+/// code) instead of panicking: `-100 - FLAC__StreamEncoderInitStatus` for
+/// settings or metadata `init` refuses, `-200 - state` for samples `process`
+/// refuses.
+pub fn try_encode_with_metadata(
+    config: &EncoderConfig,
+    interleaved: &[i32],
+    blocks: &[MetadataBlock],
+) -> Result<Vec<u8>, i32> {
+    try_run(config, MODE_STREAM, 0, interleaved, Some(blocks))
 }
 
 /// A complete Ogg FLAC stream with libFLAC's default metadata and the given Ogg

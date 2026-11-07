@@ -71,7 +71,7 @@ Rust port keeps separate (they would on arm64).
 | `shim.c` | `libflac_rs_oracle_decode` runs libFLAC's decoder (native or Ogg, chained or not) and returns the PCM per link and the reported error statuses; `libflac_rs_oracle_encode`: raw frames (metadata dropped, as CHD does), a complete stream (seekable sink, so STREAMINFO is rewritten at finish), or Ogg FLAC; plus an optional list of metadata blocks of every type |
 | `src/lib.rs` | safe wrappers mirroring `Encoder`: `encode_frames`, `encode`, `encode_with_metadata`, `encode_ogg`, taking the same `EncoderConfig` and `MetadataBlock`s; `decode` returns libFLAC's decoded links and error statuses |
 | `tests/decoder.rs` | the decoder against libFLAC's: decoded samples for native, raw-frame and Ogg streams; streams with frames cut out (silence and `MISSING_FRAME` vs `gaps`, both padding caps, seeking across a gap); chained Ogg with and without chaining; a frame with out-of-range samples (`OUT_OF_BOUNDS`) |
-| `tests/differential.rs` | the matrix: levels 0–8 × depths 8/12/16/20/24/32 × mono/stereo (frames, streams, Ogg); sample rates 8 kHz–655.35 kHz; block sizes 16–65535 incl. the CHD config; 3–8 channels; inputs of 0–4095 samples; every metadata block type, alone and combined |
+| `tests/differential.rs` | the matrix: levels 0–8 × depths 8/12/16/20/24/32 × mono/stereo (frames, streams, Ogg), plus every depth from 4 to 32 at levels 0/5/8; settings, samples and metadata rejected exactly where libFLAC rejects them (`validation_matches_libflac`); sample rates 8 kHz–655.35 kHz; block sizes 16–65535 incl. the CHD config; 3–8 channels; inputs of 0–4095 samples; every metadata block type, alone and combined |
 
 A test is a plain comparison:
 

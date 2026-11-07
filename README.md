@@ -18,8 +18,12 @@ dependencies, no build script and no `unsafe`.
 
 - **Encoder**
   - compression levels 0–8 with libFLAC's presets
-  - 8, 12, 16, 20, 24 and 32 bits per sample
-  - 1–8 channels, with mid/side stereo decorrelation
+  - every bit depth from 4 to 32, 1–8 channels (with mid/side stereo
+    decorrelation), sample rates up to 1 048 575 Hz, block sizes 16–65535
+  - input checked as libFLAC checks it: invalid settings, samples outside the bit
+    depth, and metadata libFLAC refuses or the format cannot hold are rejected
+    (`try_new`/`try_encode*` return an `EncodeError`, the other methods panic)
+    instead of producing a corrupt file
   - output as a complete `.flac` file, as raw frames (what MAME/CHD stores), or as
     Ogg FLAC
   - every metadata block: STREAMINFO (with the audio MD5), VORBIS_COMMENT with

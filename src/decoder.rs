@@ -454,7 +454,7 @@ pub fn decode_seek(data: &[u8], target_sample: u64) -> Option<SeekResult> {
     let mut first_sample = None;
     let mut interleaved = Vec::new();
     while fbr.byte_pos() < frames.len() {
-        let frame = decode_frame(&mut fbr, frames)?;
+        let frame = decode_frame(&mut fbr, Some(header.bits_per_sample))?;
         let start = timeline.place(&frame);
         match first_sample {
             None => {
@@ -558,7 +558,10 @@ pub(crate) struct Frame {
     pub samples: Vec<Vec<i32>>,
 }
 
-pub(crate) fn decode_frame(br: &mut BitReader, data: &[u8]) -> Option<Frame> {
+/// Decode one frame. `stream_bps` is STREAMINFO's bit depth, for headers that
+/// defer to it (`None` for raw frames, where libFLAC then rejects such a frame as
+/// unparseable).
+pub(crate) fn decode_frame(br: &mut BitReader, stream_bps: Option<u32>) -> Option<Frame> {
     let frame_start = br.byte_pos();
 
     // --- header ---
@@ -614,7 +617,8 @@ pub(crate) fn decode_frame(br: &mut BitReader, data: &[u8]) -> Option<Frame> {
         12 => br.read_raw_u32(8)? * 1000,
         13 => br.read_raw_u32(16)?,
         14 => br.read_raw_u32(16)? * 10,
-        _ => 0, // 0 = from STREAMINFO, 15 invalid
+        15 => return None, // invalid
+        _ => 0,            // from STREAMINFO (resolved by `Timeline::format`)
     };
     let bits_per_sample = match bps_code {
         1 => 8,
@@ -623,7 +627,8 @@ pub(crate) fn decode_frame(br: &mut BitReader, data: &[u8]) -> Option<Frame> {
         5 => 20,
         6 => 24,
         7 => 32,
-        _ => return None, // 0 from STREAMINFO, 3 reserved
+        0 => stream_bps?, // from STREAMINFO: any depth from 4 to 32
+        _ => return None, // 3 is reserved
     };
     let (assignment, channels) = match ca_code {
         0..=7 => (ChannelAssignment::Independent, ca_code + 1),
@@ -658,7 +663,6 @@ pub(crate) fn decode_frame(br: &mut BitReader, data: &[u8]) -> Option<Frame> {
     if br.read_raw_u32(16)? as u16 != computed_crc16 {
         return None;
     }
-    let _ = data; // backing slice is reached through the reader
 
     // libFLAC 1.5.0 rejects a frame whose samples do not fit its bit depth
     // (`ERROR_STATUS_OUT_OF_BOUNDS`, stream_decoder.c:2455), e.g. a side channel
@@ -1105,7 +1109,7 @@ mod tests {
         let mut ranges = Vec::new();
         while br.byte_pos() < data.len() {
             let start = br.byte_pos();
-            super::decode_frame(&mut br, data).expect("valid frame");
+            super::decode_frame(&mut br, None).expect("valid frame");
             ranges.push((start, br.byte_pos()));
         }
         ranges

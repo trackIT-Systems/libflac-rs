@@ -483,3 +483,19 @@ fn stream_decoder_matches_libflac() {
     let expected: Vec<Vec<i32>> = c.links.into_iter().map(|l| l.interleaved).collect();
     assert_eq!(stream_links(&chained), expected);
 }
+
+/// Every bit depth from 4 to 32: each decoder reads the other encoder's output,
+/// including the depths whose frame headers defer to STREAMINFO.
+#[test]
+fn decodes_every_bit_depth() {
+    for bps in 4..=32 {
+        let pcm = signal(2, bps, 4096, 2, u64::from(bps));
+        let cfg = EncoderConfig::new(2, bps, 44_100);
+        let c = oracle::encode(&cfg, &pcm);
+        let rust = decode(&c).unwrap_or_else(|| panic!("{bps}-bit libFLAC stream"));
+        assert_eq!(rust.interleaved, pcm, "{bps}-bit");
+        assert!(rust.md5_ok, "{bps}-bit");
+        let back = oracle::decode(&Encoder::new(cfg).encode(&pcm), false, false);
+        assert_eq!(back.links[0].interleaved, pcm, "{bps}-bit");
+    }
+}

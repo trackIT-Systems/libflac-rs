@@ -4,8 +4,8 @@
 //! channel decision (L/R vs L/S vs R/S vs M/S by estimated bits, including the
 //! `loose_mid_side` first-difference heuristic). All compression levels 0–8 are
 //! supported via [`Config`]/[`preset`] (the `tukey(0.5)` / `subdivide_tukey(2|3)`
-//! apodizations and the per-level LPC-order / partition-order caps). All bit depths
-//! 8/12/16/20/24/32 are supported — RICE2 entropy coding above 16 bps, and for
+//! apodizations and the per-level LPC-order / partition-order caps). Every bit depth
+//! the format allows (4–32) is supported — RICE2 entropy coding above 16 bps, and for
 //! 32-bit input the 33-bit `i64` side channel plus the wide / overflow-limited
 //! residual paths.
 
@@ -17,6 +17,7 @@ use crate::format::{
     MAX_QLP_COEFF_PRECISION, MIN_QLP_COEFF_PRECISION,
 };
 use crate::frame::{ChannelAssignment, FrameHeader, write_frame_footer, write_frame_header};
+use crate::validate::{self, EncodeError};
 use crate::{fixed, lpc, metadata, ogg, rice, subframe, window};
 
 /// Minimum residual partition order (0 for every compression level).
@@ -1065,9 +1066,9 @@ pub fn encode_ogg(
 pub struct EncoderConfig {
     /// Number of channels, 1–8. Stereo (2) enables mid/side decorrelation.
     pub channels: u32,
-    /// Bits per sample: 8, 12, 16, 20, 24, or 32.
+    /// Bits per sample, 4–32.
     pub bits_per_sample: u32,
-    /// Sample rate in Hz.
+    /// Sample rate in Hz, up to 1 048 575 (0: unknown).
     pub sample_rate: u32,
     /// Fixed block size in samples (the final frame may be shorter). `0` selects
     /// libFLAC's default when the [`Encoder`] is created (`stream_encoder.c:748`):
@@ -1132,6 +1133,11 @@ impl EncoderConfig {
 /// within a sample — `L R L R …` for stereo, each value a sign-extended `i32`) and
 /// returns the encoded bytes.
 ///
+/// Settings, samples and metadata are checked the way libFLAC checks them, plus
+/// the limits of the format's fields: the `try_*` methods return an
+/// [`EncodeError`], the others panic with it. Anything the format can hold is
+/// accepted.
+///
 /// ```
 /// use libflac_rs::{Encoder, EncoderConfig};
 ///
@@ -1139,6 +1145,9 @@ impl EncoderConfig {
 /// let pcm = vec![0i32; 4096 * 2]; // one block of stereo silence, interleaved
 /// let flac = enc.encode(&pcm);    // a complete .flac file
 /// assert_eq!(&flac[..4], b"fLaC");
+///
+/// // A sample that does not fit 16 bits is rejected, not silently corrupted.
+/// assert!(enc.try_encode(&[40_000, 0]).is_err());
 /// ```
 pub struct Encoder {
     config: EncoderConfig,
@@ -1147,12 +1156,24 @@ pub struct Encoder {
 
 impl Encoder {
     /// Create an encoder from `config`.
-    pub fn new(mut config: EncoderConfig) -> Self {
+    ///
+    /// # Panics
+    /// If `config` is invalid; see [`Encoder::try_new`].
+    pub fn new(config: EncoderConfig) -> Self {
+        Self::try_new(config).unwrap_or_else(|e| panic!("invalid FLAC encoder settings: {e}"))
+    }
+
+    /// Create an encoder from `config`, rejecting what libFLAC's encoder rejects
+    /// (`init_stream_internal_`, `stream_encoder.c:732-756`): 1–8 channels, 4–32
+    /// bits per sample, a sample rate up to 1 048 575 Hz, and a block size of
+    /// 16–65535 or 0 for libFLAC's default.
+    pub fn try_new(mut config: EncoderConfig) -> Result<Self, EncodeError> {
+        validate::check_config(&config)?;
         let inner = preset(config.compression_level);
         if config.block_size == 0 {
             config.block_size = if inner.max_lpc_order == 0 { 1152 } else { 4096 };
         }
-        Self { config, inner }
+        Ok(Self { config, inner })
     }
 
     /// The configuration this encoder was built with, with a `block_size` of 0
@@ -1164,22 +1185,42 @@ impl Encoder {
     /// Encode to **raw FLAC frames** — no `fLaC` marker or metadata — the byte stream
     /// MAME/CHD embeds. (The `md5` setting has no effect here: MD5 lives in
     /// STREAMINFO, which raw frames omit.)
+    ///
+    /// # Panics
+    /// If the input is invalid; see [`Encoder::try_encode_frames`].
     pub fn encode_frames(&self, interleaved: &[i32]) -> Vec<u8> {
-        encode_frames(
+        expect_valid(self.try_encode_frames(interleaved))
+    }
+
+    /// [`Encoder::encode_frames`], rejecting input that is not a whole number of
+    /// samples per channel or holds a sample outside the bit depth (as libFLAC's
+    /// `FLAC__stream_encoder_process_interleaved` does).
+    pub fn try_encode_frames(&self, interleaved: &[i32]) -> Result<Vec<u8>, EncodeError> {
+        self.check_samples(interleaved)?;
+        Ok(encode_frames(
             interleaved,
             self.config.channels,
             self.config.bits_per_sample,
             self.config.sample_rate,
             self.config.block_size,
             &self.inner,
-        )
+        ))
     }
 
     /// Encode to a complete `.flac` file (the `fLaC` marker, STREAMINFO, libFLAC's
     /// default VORBIS_COMMENT, then the frames) — byte-identical to libFLAC's default
     /// output. Use [`Encoder::encode_with_metadata`] to control the metadata.
+    ///
+    /// # Panics
+    /// If the input is invalid; see [`Encoder::try_encode`].
     pub fn encode(&self, interleaved: &[i32]) -> Vec<u8> {
-        self.encode_with_metadata(
+        expect_valid(self.try_encode(interleaved))
+    }
+
+    /// [`Encoder::encode`], rejecting invalid samples as
+    /// [`Encoder::try_encode_frames`] does.
+    pub fn try_encode(&self, interleaved: &[i32]) -> Result<Vec<u8>, EncodeError> {
+        self.try_encode_with_metadata(
             interleaved,
             &[metadata::MetadataBlock::VorbisComment(
                 metadata::LIBFLAC_VENDOR_STRING,
@@ -1194,12 +1235,33 @@ impl Encoder {
     /// [`LIBFLAC_VENDOR_STRING`](crate::LIBFLAC_VENDOR_STRING) first. A
     /// [`MetadataBlock::Seektable`](crate::MetadataBlock::Seektable) is filled in
     /// during encoding.
+    ///
+    /// # Panics
+    /// If the input or a block is invalid; see
+    /// [`Encoder::try_encode_with_metadata`].
     pub fn encode_with_metadata(
         &self,
         interleaved: &[i32],
         blocks: &[metadata::MetadataBlock],
     ) -> Vec<u8> {
-        encode(
+        expect_valid(self.try_encode_with_metadata(interleaved, blocks))
+    }
+
+    /// [`Encoder::encode_with_metadata`], rejecting invalid samples as
+    /// [`Encoder::try_encode_frames`] does and blocks libFLAC rejects
+    /// (`init_stream_internal_`'s checks: at most one SEEKTABLE and one
+    /// VORBIS_COMMENT, ascending seek points, legal cue sheets and pictures, at
+    /// most one standard and one other file icon) or the format cannot hold
+    /// (bodies of 16 MiB or more, over 255 cue sheet tracks or index points,
+    /// Vorbis comments that are not `NAME=value`).
+    pub fn try_encode_with_metadata(
+        &self,
+        interleaved: &[i32],
+        blocks: &[metadata::MetadataBlock],
+    ) -> Result<Vec<u8>, EncodeError> {
+        self.check_samples(interleaved)?;
+        validate::check_metadata(blocks)?;
+        Ok(encode(
             interleaved,
             self.config.channels,
             self.config.bits_per_sample,
@@ -1208,14 +1270,24 @@ impl Encoder {
             &self.inner,
             self.config.md5,
             blocks,
-        )
+        ))
     }
 
     /// Encode to a complete **Ogg FLAC** stream with the given Ogg logical-bitstream
     /// `serial` number. libFLAC's default VORBIS_COMMENT is included; any SEEKTABLE is
     /// dropped (as libFLAC does for Ogg).
+    ///
+    /// # Panics
+    /// If the input is invalid; see [`Encoder::try_encode_ogg`].
     pub fn encode_ogg(&self, interleaved: &[i32], serial: i32) -> Vec<u8> {
-        encode_ogg(
+        expect_valid(self.try_encode_ogg(interleaved, serial))
+    }
+
+    /// [`Encoder::encode_ogg`], rejecting invalid samples as
+    /// [`Encoder::try_encode_frames`] does.
+    pub fn try_encode_ogg(&self, interleaved: &[i32], serial: i32) -> Result<Vec<u8>, EncodeError> {
+        self.check_samples(interleaved)?;
+        Ok(encode_ogg(
             interleaved,
             self.config.channels,
             self.config.bits_per_sample,
@@ -1227,6 +1299,19 @@ impl Encoder {
                 metadata::LIBFLAC_VENDOR_STRING,
             )],
             serial,
+        ))
+    }
+
+    fn check_samples(&self, interleaved: &[i32]) -> Result<(), EncodeError> {
+        validate::check_samples(
+            interleaved,
+            self.config.channels,
+            self.config.bits_per_sample,
         )
     }
+}
+
+/// Unwrap an encode result, panicking with the reason.
+fn expect_valid(result: Result<Vec<u8>, EncodeError>) -> Vec<u8> {
+    result.unwrap_or_else(|e| panic!("invalid FLAC encoder input: {e}"))
 }

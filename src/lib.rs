@@ -8,10 +8,11 @@
 //! of the source tree so the crate is 100% pure Rust.
 //!
 //! # What's supported
-//! - **Encoder**, byte-identical to libFLAC: all compression levels 0–8, all bit
-//!   depths (8/12/16/20/24/32), mono / stereo (with mid-side decorrelation) /
+//! - **Encoder**, byte-identical to libFLAC: all compression levels 0–8, every bit
+//!   depth from 4 to 32, mono / stereo (with mid-side decorrelation) /
 //!   multichannel, every metadata block (STREAMINFO, VORBIS_COMMENT, PADDING,
-//!   APPLICATION, SEEKTABLE, PICTURE, CUESHEET), and the audio MD5.
+//!   APPLICATION, SEEKTABLE, PICTURE, CUESHEET), and the audio MD5. Settings,
+//!   samples and metadata are validated as libFLAC does ([`EncodeError`]).
 //! - **Decoder**: lossless and MD5-verified, streaming ([`StreamDecoder`]) or
 //!   into memory, with [`decode_seek`], variable block
 //!   sizes, chained Ogg ([`decode_ogg_chained`]), and missing frames filled with
@@ -71,6 +72,7 @@ mod ogg;
 mod rice;
 mod stream;
 mod subframe;
+mod validate;
 mod window;
 
 pub use decoder::{
@@ -83,3 +85,4 @@ pub use metadata::{
     spaced_seek_points, vorbis_comment_entry,
 };
 pub use stream::{DecodeError, DecodeOptions, DecodedBlock, StreamDecoder};
+pub use validate::EncodeError;

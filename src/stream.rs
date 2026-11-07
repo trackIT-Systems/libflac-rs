@@ -253,7 +253,7 @@ impl<R: Read> StreamDecoder<R> {
             let (link, header) = find_ogg_link(&mut input)?.ok_or(DecodeError::Malformed)?;
             (Container::Ogg(link), header)
         } else if head[0] == 0xFF && head[1] & 0xFE == 0xF8 {
-            let frame = read_frame(&mut input)?.ok_or(DecodeError::Malformed)?;
+            let frame = read_frame(&mut input, None)?.ok_or(DecodeError::Malformed)?;
             let header = StreamHeader {
                 channels: frame.channels,
                 bits_per_sample: frame.bits_per_sample,
@@ -437,12 +437,14 @@ impl<R: Read> StreamDecoder<R> {
 
     /// The next frame of the current stream or link, `None` at its end.
     fn next_frame(&mut self) -> Result<Option<Frame>, DecodeError> {
+        let stream_bps = Some(self.header.bits_per_sample);
         match &mut self.container {
-            Container::Native | Container::Raw => read_frame(&mut self.input),
+            Container::Native => read_frame(&mut self.input, stream_bps),
+            Container::Raw => read_frame(&mut self.input, None),
             Container::Ogg(link) => loop {
                 if let Some(packet) = link.packets.pop_front() {
                     let mut br = BitReader::new(&packet);
-                    return decode_frame(&mut br, &packet)
+                    return decode_frame(&mut br, stream_bps)
                         .map(Some)
                         .ok_or(DecodeError::Malformed);
                 }
@@ -510,7 +512,10 @@ fn read_native_header<R: Read>(input: &mut Input<R>) -> Result<StreamHeader, Dec
 }
 
 /// The next frame from a native/raw stream, `None` at the end of the input.
-fn read_frame<R: Read>(input: &mut Input<R>) -> Result<Option<Frame>, DecodeError> {
+fn read_frame<R: Read>(
+    input: &mut Input<R>,
+    stream_bps: Option<u32>,
+) -> Result<Option<Frame>, DecodeError> {
     loop {
         let avail = input.available();
         if avail.is_empty() {
@@ -521,7 +526,7 @@ fn read_frame<R: Read>(input: &mut Input<R>) -> Result<Option<Frame>, DecodeErro
             continue;
         }
         let mut br = BitReader::new(avail);
-        if let Some(frame) = decode_frame(&mut br, avail) {
+        if let Some(frame) = decode_frame(&mut br, stream_bps) {
             let used = br.byte_pos();
             input.consume(used);
             return Ok(Some(frame));
