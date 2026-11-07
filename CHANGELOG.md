@@ -4,7 +4,7 @@ Releases are GitHub releases of this repository (not crates.io). Versions follow
 `0.<libFLAC digits>.<patch>`: the minor is the libFLAC release the encoder is
 bit-exact with, the patch counts our own changes against it.
 
-## Unreleased
+## 0.150.2
 
 ### Added
 
@@ -17,7 +17,6 @@ bit-exact with, the patch counts our own changes against it.
   with `DecodeError::LimitExceeded` before the output passes the limit. A small
   file can otherwise legitimately expand to gigabytes (measured: 36 bytes per
   2 MiB of silence, 72 bytes to 84 MB through a filled gap).
-
 - Encoder input validation (`EncodeError`): `Encoder::try_new` and
   `try_encode`, `try_encode_frames`, `try_encode_with_metadata`, `try_encode_ogg`
   reject what libFLAC rejects — channels outside 1–8, bit depths outside 4–32,
@@ -56,8 +55,8 @@ bit-exact with, the patch counts our own changes against it.
 - Ogg FLAC is decoded as libFLAC does: the packets of the FLAC logical stream are
   concatenated (mapping headers stripped) and parsed as a native stream, with
   libogg's handling of sequence gaps and continued packets. A lost metadata page
-  therefore has libFLAC's effect.
-- Found by differential fuzzing; every finding so far agrees with libFLAC.
+  therefore has libFLAC's effect. These rules were found by differential
+  fuzzing; every finding so far decodes as in libFLAC.
 - `Encoder::new` and the `encode*` methods panic with the `EncodeError` on
   invalid settings or input. Before, they wrote a corrupt stream or decoded to
   different samples without notice.

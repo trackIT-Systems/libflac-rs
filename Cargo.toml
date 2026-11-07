@@ -5,8 +5,8 @@ name = "libflac-rs"
 # libFLAC release this crate is bit-exact with (1.5.0 -> 150); the patch counts
 # our own fixes against that target (0.150.0, 0.150.1, ...). The leading 0 marks
 # the public API as still unstable. Retargeting a new libFLAC bumps the minor.
-# Keep in sync with the git tag (v0.150.1).
-version = "0.150.1"
+# Keep in sync with the git tag (v0.150.2).
+version = "0.150.2"
 edition = "2024"
 rust-version = "1.85"
 license = "BSD-3-Clause"

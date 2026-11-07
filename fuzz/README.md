@@ -32,7 +32,7 @@ prints the blocks and libFLAC errors of those that still disagree.
 
 ## Differences from libFLAC's decoder
 
-Every `diff_decode` finding so far (864 from three runs, then none in 24 M executions) decodes to libFLAC's
+Every `diff_decode` finding so far (865 from three runs, then none in 24 M executions) decodes to libFLAC's
 samples or is rejected by both. The remaining differences are deliberate or not
 reachable by this harness:
 

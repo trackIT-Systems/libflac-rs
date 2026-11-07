@@ -318,5 +318,5 @@ residual/rice → CRC-16 — diffing at the first mismatching field.
 - Library is `#![forbid(unsafe_code)]`, edition 2024, MSRV 1.85, **zero
   dependencies** (pure `std`, not even a build script) — keep it that way. C and
   `cc` live only in the separate `oracle/` workspace; see `ORACLE.md`.
-- Version scheme `0.<flac-digits>.<patch>` (1.5.0 → `0.150.x`); git tag `v0.150.1`.
+- Version scheme `0.<flac-digits>.<patch>` (1.5.0 → `0.150.x`); git tag `v0.150.2`.
   Every release gets a `CHANGELOG.md` section, which `release.yml` uses as notes.

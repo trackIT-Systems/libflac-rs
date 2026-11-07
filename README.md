@@ -45,7 +45,7 @@ Releases are published on GitHub, not on crates.io:
 
 ```toml
 [dependencies]
-libflac-rs = { git = "https://github.com/trackIT-Systems/libflac-rs", tag = "v0.150.1" }
+libflac-rs = { git = "https://github.com/trackIT-Systems/libflac-rs", tag = "v0.150.2" }
 ```
 
 What changed between versions is in [`CHANGELOG.md`](CHANGELOG.md).
