@@ -1,0 +1,49 @@
+[package]
+name = "libflac-rs-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Fuzz targets for libflac-rs (cargo-fuzz): decoder robustness, round trips, and differential encoding/decoding against libFLAC."
+
+[package.metadata]
+cargo-fuzz = true
+
+# A workspace of its own, like oracle/, so the library's builds never see these
+# dependencies.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = { version = "0.4", features = ["arbitrary-derive"] }
+libflac-rs = { path = ".." }
+libflac-rs-oracle = { path = "../oracle" }
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "decode"
+path = "fuzz_targets/decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "roundtrip"
+path = "fuzz_targets/roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "diff_encode"
+path = "fuzz_targets/diff_encode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "diff_decode"
+path = "fuzz_targets/diff_decode.rs"
+test = false
+doc = false
+bench = false

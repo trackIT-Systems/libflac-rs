@@ -1,0 +1,37 @@
+# Fuzzing
+
+[cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) targets for libflac-rs. A
+workspace of its own, like `oracle/`; the library does not depend on it.
+
+| Target | Input | Fails when |
+| --- | --- | --- |
+| `decode` | arbitrary bytes | any decode function panics or hangs |
+| `roundtrip` | generated settings and signal | `decode(encode(x)) != x` |
+| `diff_encode` | generated settings and signal | the bytes differ from libFLAC's, or only one side rejects the input |
+| `diff_decode` | arbitrary bytes | Rust decodes samples libFLAC does not, or rejects what libFLAC decodes without any error |
+
+The signal generator builds constant, ramp, sine, noise, square and raw segments,
+so LPC, fixed and constant subframes all occur. The `diff_*` targets link the C
+oracle, so fetch its sources first (`../oracle/fetch-sources.sh`).
+
+```sh
+cargo install cargo-fuzz        # needs a C compiler; nightly only for sanitizers
+cargo run --example seed -- corpus/decode corpus/diff_decode   # seed corpus
+cargo fuzz run -s none decode -- -max_total_time=600
+cargo fuzz run -s none diff_decode -- -fork=4 -ignore_crashes=1 -max_total_time=1800
+cargo run --release --example replay_diff_decode -- artifacts/diff_decode/*
+```
+
+`-s none` skips the address sanitizer: the library has no `unsafe`, and it is
+several times faster. Decoded output above about 4 M samples per input is not
+collected (`MAX_OUTPUT`), since tiny inputs can legitimately expand to gigabytes.
+
+`corpus/` and `artifacts/` are not committed. `replay_diff_decode` re-checks saved
+`diff_decode` findings against the current decoder and groups them.
+
+## Known differences from libFLAC's decoder
+
+`diff_decode` still reports a long tail of heavily mangled streams that one
+decoder rejects and the other decodes in part, e.g. where libFLAC gives up on the
+whole stream after an early error but Rust decodes the frames it can (see the
+issue tracker). Valid and truncated streams decode identically.

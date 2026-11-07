@@ -131,9 +131,10 @@ The full API is documented in the crate docs (`cargo doc --open`).
   platforms in rare cases. Measurements are in [`ORACLE.md`](ORACLE.md).
 - **Decoder.** Byte-identical output is an encoder property; the decoder is
   checked for producing the same samples as libFLAC 1.5.0's decoder, including
-  chained Ogg links and the silence it inserts for missing frames. Unlike libFLAC,
-  it does not resynchronize after a corrupt frame (bad CRC, or samples beyond the
-  bit depth): decoding then fails.
+  chained Ogg links, the silence it inserts for missing frames, its arithmetic on
+  damaged frames, and ending a truncated stream after the last complete frame
+  (`truncated`). Unlike libFLAC, it does not resynchronize after a corrupt frame
+  (bad CRC, or samples beyond the bit depth): decoding then fails.
 
 ## How it is verified
 
@@ -147,6 +148,10 @@ runs in CI on glibc and musl. The library itself never builds C.
 cargo test                                            # the library: unit and round-trip tests
 oracle/fetch-sources.sh && (cd oracle && cargo test)  # against the C reference
 ```
+
+The `fuzz/` crate (cargo-fuzz) checks the decoder against arbitrary input, the
+encoder for lossless round trips, and both against libFLAC on generated signals
+and mutated streams; see [`fuzz/README.md`](fuzz/README.md).
 
 [`ORACLE.md`](ORACLE.md) describes the oracle; [`ROADMAP.md`](ROADMAP.md) records how
 the port was built.

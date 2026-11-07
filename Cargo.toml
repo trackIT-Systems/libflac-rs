@@ -21,8 +21,8 @@ readme = "README.md"
 # The packaged crate is a pure-Rust, dependency-free library plus its docs (src,
 # README/ROADMAP/ORACLE/LICENSE). Drop the AI dev guide, the CI config and the
 # differential-test crate `oracle/` (its own workspace; the only place C and `cc`
-# appear — see ORACLE.md).
-exclude = ["/.github", "/CLAUDE.md", "/oracle"]
+# appear — see ORACLE.md) and the fuzz targets in `fuzz/`.
+exclude = ["/.github", "/CLAUDE.md", "/oracle", "/fuzz"]
 
 [lib]
 name = "libflac_rs"
