@@ -39,6 +39,11 @@ impl<'a> BitReader<'a> {
         self.pos / 8
     }
 
+    /// Current position in bits.
+    pub fn bit_pos(&self) -> usize {
+        self.pos
+    }
+
     pub fn is_byte_aligned(&self) -> bool {
         self.pos % 8 == 0
     }
@@ -100,8 +105,13 @@ impl<'a> BitReader<'a> {
     /// Read one Rice-coded signed value with the given parameter
     /// (`FLAC__bitreader_read_rice_signed`): unary MSBs, `parameter` LSBs, then
     /// zigzag-unfold.
+    /// A quotient that cannot belong to a 32-bit residual (`msbs > u32::MAX >>
+    /// parameter`) is invalid, as in libFLAC's `read_rice_signed_block`.
     pub fn read_rice_signed(&mut self, parameter: u32) -> Option<i32> {
         let msbs = self.read_unary()?;
+        if msbs > u32::MAX >> parameter {
+            return None;
+        }
         let lsbs = self.read_raw_u32(parameter)?;
         let uval = (msbs << parameter) | lsbs;
         // zigzag: odd -> -(uval>>1)-1, even -> uval>>1.
@@ -177,11 +187,6 @@ impl<'a> BitReader<'a> {
             v = (v << 6) | (x & 0x3F);
         }
         Some(v)
-    }
-
-    /// Skip to the next byte boundary (used before a frame's CRC-16).
-    pub fn align_to_byte(&mut self) {
-        self.pos = (self.pos + 7) & !7;
     }
 
     /// Skip `n` bytes (must be byte-aligned); used to step over metadata blocks.

@@ -328,3 +328,128 @@ fn ogg_truncation_and_junk_are_tolerated() {
     assert_eq!(blocks(&mut dec), input);
     assert!(!dec.truncated());
 }
+
+/// Metadata handling as in libFLAC: a SEEKTABLE whose length is not a multiple of
+/// 18 stops decoding; a stream without STREAMINFO decodes like raw frames; ID3v2
+/// tags before `fLaC` are skipped.
+#[test]
+fn metadata_quirks_match_libflac() {
+    let input = pcm(2, 5_000, 9);
+    let enc = Encoder::new(EncoderConfig::new(2, 16, 44_100).with_block_size(1024));
+    let flac = enc.encode_with_metadata(
+        &input,
+        &[
+            MetadataBlock::VorbisComment(LIBFLAC_VENDOR_STRING),
+            MetadataBlock::Padding(19),
+        ],
+    );
+    // STREAMINFO (4+34) + VORBIS_COMMENT header and body, then PADDING.
+    let vc_len = u32::from_be_bytes([0, flac[43], flac[44], flac[45]]) as usize;
+    let padding = 4 + 4 + 34 + 4 + vc_len;
+    assert_eq!(flac[padding] & 0x7F, 1);
+
+    // The 19-byte PADDING turned into a SEEKTABLE: libFLAC gives up.
+    let mut bad_table = flac.clone();
+    bad_table[padding] = (bad_table[padding] & 0x80) | 3;
+    assert!(decode(&bad_table).is_none());
+
+    // STREAMINFO's type changed to APPLICATION: no STREAMINFO, so the format comes
+    // from the frames and nothing bounds the length.
+    let mut no_info = flac.clone();
+    no_info[4] = (no_info[4] & 0x80) | 2;
+    let decoded = decode(&no_info).unwrap();
+    assert_eq!(decoded.interleaved, input);
+    assert_eq!((decoded.channels, decoded.total_samples), (2, 0));
+
+    // ID3v2 tags (10-byte header with a syncsafe size of 300) in front.
+    let id3 = [
+        b"ID3\x04\x00\x00\x00\x00\x02\x2C".as_slice(),
+        &[0u8; 300],
+        &flac,
+    ]
+    .concat();
+    assert_eq!(decode(&id3).unwrap().interleaved, input);
+    let mut dec = StreamDecoder::new(trickle(&id3)).unwrap();
+    assert_eq!(blocks(&mut dec), input);
+}
+
+/// The scan for the stream start, short APPLICATION blocks, and Ogg handled as a
+/// byte stream, all as libFLAC does.
+#[test]
+fn stream_start_and_ogg_rules_match_libflac() {
+    let input = pcm(1, 3_000, 10);
+    let enc = Encoder::new(EncoderConfig::new(1, 16, 44_100).with_block_size(512));
+
+    // Junk before a frame sync is skipped (libFLAC's find_metadata_).
+    let frames = enc.encode_frames(&input);
+    let junk = [&b"f\x00junk"[..], &frames].concat();
+    assert_eq!(decode_frames(&frames).unwrap().interleaved, input);
+    let mut dec = StreamDecoder::new(&junk[..]).unwrap();
+    assert_eq!(blocks(&mut dec), input);
+
+    // An ID3v2 tag must be followed by fLaC.
+    let flac = enc.encode(&input);
+    let id3 = |after: &[u8]| [&b"ID3\x04\x00\x00\x00\x00\x00\x02xy"[..], after].concat();
+    assert!(decode(&id3(&flac)).is_some());
+    assert!(decode(&id3(&[b"x", &flac[..]].concat())).is_none());
+
+    // An APPLICATION block shorter than its 4-byte id stops decoding.
+    let short_app = [
+        &flac[..4],
+        &[0x02, 0, 0, 0][..], // APPLICATION, not last, length 0
+        &flac[4..],
+    ]
+    .concat();
+    assert!(decode(&short_app).is_none());
+
+    // Ogg: losing the page with the VORBIS_COMMENT packet loses the end of the
+    // metadata, so (as in libFLAC) the frames are read as metadata: no audio.
+    let ogg = enc.encode_ogg(&input, 6);
+    let page_len = |at: usize| {
+        let n = ogg[at + 26] as usize;
+        27 + n
+            + ogg[at + 27..at + 27 + n]
+                .iter()
+                .map(|&b| b as usize)
+                .sum::<usize>()
+    };
+    let first = page_len(0);
+    let second = page_len(first);
+    let lost = [&ogg[..first], &ogg[first + second..]].concat();
+    assert!(libflac_rs::decode_ogg(&ogg).is_some());
+    assert!(libflac_rs::decode_ogg(&lost).is_none());
+
+    // A packet starting with 0x7F must carry a valid mapping header.
+    let mut bad_mapping = ogg.clone();
+    bad_mapping[27 + ogg[26] as usize + 5] = 2; // mapping major version 2
+    let crc_fixed = fix_page_crc(&bad_mapping, 0);
+    assert!(libflac_rs::decode_ogg(&crc_fixed).is_none());
+}
+
+/// Recompute the CRC of the page at `at` (libogg: polynomial 0x04c11db7, MSB
+/// first, initial 0, CRC field zeroed).
+fn fix_page_crc(ogg: &[u8], at: usize) -> Vec<u8> {
+    let mut out = ogg.to_vec();
+    let n = out[at + 26] as usize;
+    let end = at
+        + 27
+        + n
+        + out[at + 27..at + 27 + n]
+            .iter()
+            .map(|&b| b as usize)
+            .sum::<usize>();
+    out[at + 22..at + 26].fill(0);
+    let mut crc = 0u32;
+    for &byte in &out[at..end] {
+        crc ^= u32::from(byte) << 24;
+        for _ in 0..8 {
+            crc = if crc & 0x8000_0000 != 0 {
+                (crc << 1) ^ 0x04c1_1db7
+            } else {
+                crc << 1
+            };
+        }
+    }
+    out[at + 22..at + 26].copy_from_slice(&crc.to_le_bytes());
+    out
+}

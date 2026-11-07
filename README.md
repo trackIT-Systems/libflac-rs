@@ -132,8 +132,8 @@ The full API is documented in the crate docs (`cargo doc --open`).
 - **Decoder.** Byte-identical output is an encoder property; the decoder is
   checked for producing the same samples as libFLAC 1.5.0's decoder, including
   chained Ogg links, the silence it inserts for missing frames, its arithmetic on
-  damaged frames, and ending a truncated stream after the last complete frame
-  (`truncated`). Unlike libFLAC, it does not resynchronize after a corrupt frame
+  damaged frames, its handling of malformed metadata and Ogg pages, and ending a
+  truncated stream after the last complete frame (`truncated`). Unlike libFLAC, it does not resynchronize after a corrupt frame
   (bad CRC, or samples beyond the bit depth): decoding then fails.
 
 ## How it is verified

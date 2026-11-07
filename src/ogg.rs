@@ -237,9 +237,13 @@ impl OggStream {
 
 /// One Ogg page, borrowed from the input.
 pub struct Page<'a> {
+    /// Stream structure version; libogg accepts only 0.
+    pub version: u8,
     /// Header-type flags: 0x01 continued packet, 0x02 BOS, 0x04 EOS.
     pub flags: u8,
     pub serial: u32,
+    /// Page sequence number.
+    pub sequence: u32,
     /// Lacing values: a value `< 255` ends a packet, `255` continues it.
     pub lacing: &'a [u8],
     pub body: &'a [u8],
@@ -283,8 +287,10 @@ pub fn parse_page(data: &[u8]) -> Option<PageParse<'_>> {
     }
     Some(PageParse::Page(
         Page {
+            version: data[4],
             flags: data[5],
             serial: u32::from_le_bytes(data[14..18].try_into().ok()?),
+            sequence: u32::from_le_bytes(data[18..22].try_into().ok()?),
             lacing,
             body: &data[body_start..body_end],
         },

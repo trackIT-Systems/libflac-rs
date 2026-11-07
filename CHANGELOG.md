@@ -45,8 +45,19 @@ bit-exact with, the patch counts our own changes against it.
   same samples, and it checks frame and subframe headers as libFLAC does
   (reserved bits, invalid UTF-8 numbers, block size 65536, reserved subframe
   types, a set padding bit, predictor orders not below the block size; a frame
-  number counts as a sample number when STREAMINFO's block sizes differ). Found by
-  differential fuzzing.
+  number counts as a sample number when STREAMINFO's block sizes differ, zero
+  padding before the CRC-16, Rice quotients that fit 32 bits). Invalid header
+  fields that libFLAC only rejects once the header is complete count as truncation
+  if the input ends first.
+- Metadata and stream start as in libFLAC: a SEEKTABLE whose length is not a
+  multiple of 18, or an APPLICATION block shorter than 4 bytes, stops decoding; a
+  stream without STREAMINFO is decoded like raw frames; ID3v2 tags before `fLaC`
+  are skipped; junk before the stream start is skipped (`find_metadata_`).
+- Ogg FLAC is decoded as libFLAC does: the packets of the FLAC logical stream are
+  concatenated (mapping headers stripped) and parsed as a native stream, with
+  libogg's handling of sequence gaps and continued packets. A lost metadata page
+  therefore has libFLAC's effect.
+- Found by differential fuzzing; every finding so far agrees with libFLAC.
 - `Encoder::new` and the `encode*` methods panic with the `EncodeError` on
   invalid settings or input. Before, they wrote a corrupt stream or decoded to
   different samples without notice.

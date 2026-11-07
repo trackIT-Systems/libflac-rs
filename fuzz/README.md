@@ -27,11 +27,18 @@ several times faster. Decoded output above about 4 M samples per input is not
 collected (`MAX_OUTPUT`), since tiny inputs can legitimately expand to gigabytes.
 
 `corpus/` and `artifacts/` are not committed. `replay_diff_decode` re-checks saved
-`diff_decode` findings against the current decoder and groups them.
+`diff_decode` findings against the current decoder and groups them; `explain`
+prints the blocks and libFLAC errors of those that still disagree.
 
-## Known differences from libFLAC's decoder
+## Differences from libFLAC's decoder
 
-`diff_decode` still reports a long tail of heavily mangled streams that one
-decoder rejects and the other decodes in part, e.g. where libFLAC gives up on the
-whole stream after an early error but Rust decodes the frames it can (see the
-issue tracker). Valid and truncated streams decode identically.
+Every `diff_decode` finding so far (864 from three runs, then none in 24 M executions) decodes to libFLAC's
+samples or is rejected by both. The remaining differences are deliberate or not
+reachable by this harness:
+
+- After a corrupt frame libFLAC searches for the next frame sync and continues;
+  this decoder stops with `DecodeError::Malformed`. (`diff_decode` only checks
+  that Rust's output is a prefix of libFLAC's.)
+- Decoding stops at STREAMINFO's sample count; libFLAC decodes past it.
+- libFLAC skips the Rice quotient limit when a symbol straddles the end of its
+  read buffer (`incomplete_msbs`), which depends on how the input is fed.

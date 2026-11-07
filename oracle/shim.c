@@ -471,10 +471,17 @@ static void dec_metadata(const FLAC__StreamDecoder *decoder,
                          const FLAC__StreamMetadata *metadata, void *client_data) {
     dec_state *d = (dec_state *)client_data;
     (void)decoder;
-    /* every stream and every chain link starts with its own STREAMINFO */
+    /* Every stream and every chain link starts with its own STREAMINFO. A
+     * repeated STREAMINFO before any audio (libFLAC takes the last one) updates
+     * the current link instead of starting another. */
     if (metadata->type == FLAC__METADATA_TYPE_STREAMINFO) {
         const FLAC__StreamMetadata_StreamInfo *si = &metadata->data.stream_info;
-        if (!start_link(d, si->channels, si->bits_per_sample, si->sample_rate)) {
+        if (d->num_links > 0 && d->links[d->num_links - 1].first == d->pcm_len) {
+            oracle_link *l = &d->links[d->num_links - 1];
+            l->channels = si->channels;
+            l->bits_per_sample = si->bits_per_sample;
+            l->sample_rate = si->sample_rate;
+        } else if (!start_link(d, si->channels, si->bits_per_sample, si->sample_rate)) {
             d->failed = 1;
         }
     }

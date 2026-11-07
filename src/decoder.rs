@@ -169,7 +169,7 @@ pub(crate) fn parse_vorbis_comment(body: &[u8]) -> Option<DecodedVorbisComment> 
 /// The whole stream is decoded into memory. For long streams or untrusted input,
 /// use [`StreamDecoder`] or [`decode_with`] with a sample limit.
 pub fn decode(data: &[u8]) -> Option<DecodedStream> {
-    if !data.starts_with(b"fLaC") {
+    if data.starts_with(b"OggS") {
         return None;
     }
     collect(&mut StreamDecoder::new(data).ok()?, None).ok()
@@ -350,7 +350,8 @@ fn parse_header(br: &mut BitReader) -> Option<StreamHeader> {
         let body = br.bytes_since(start);
         match block_type {
             0 => header = Some(parse_streaminfo(body)?),
-            3 => seek_points = parse_seektable(body),
+            2 if body.len() < 4 => return None, // APPLICATION without its id
+            3 => seek_points = parse_seektable(body)?,
             4 => vorbis_comment = parse_vorbis_comment(body),
             _ => {}
         }
@@ -392,16 +393,22 @@ pub(crate) fn parse_streaminfo(body: &[u8]) -> Option<StreamHeader> {
     })
 }
 
-/// A SEEKTABLE body: `len / 18` points of (sample u64, offset u64, samples u16);
-/// a length not divisible by 18 (non-conforming writers) is tolerated.
-pub(crate) fn parse_seektable(body: &[u8]) -> Vec<SeekPoint> {
-    body.chunks_exact(18)
+/// A SEEKTABLE body: `len / 18` points of (sample u64, offset u64, samples u16).
+/// `None` if the length is not a multiple of 18, where libFLAC stops decoding
+/// (`read_metadata_seektable_`).
+pub(crate) fn parse_seektable(body: &[u8]) -> Option<Vec<SeekPoint>> {
+    if body.len() % 18 != 0 {
+        return None;
+    }
+    let points = body
+        .chunks_exact(18)
         .map(|p| SeekPoint {
             sample_number: u64::from_be_bytes(p[0..8].try_into().unwrap()),
             stream_offset: u64::from_be_bytes(p[8..16].try_into().unwrap()),
             frame_samples: u32::from(u16::from_be_bytes([p[16], p[17]])),
         })
-        .collect()
+        .collect();
+    Some(points)
 }
 
 /// The result of a [`decode_seek`]: PCM from `first_sample` to the end of the
@@ -592,17 +599,31 @@ pub(crate) fn decode_frame(br: &mut BitReader, stream: Option<&StreamHeader>) ->
     let frame_start = br.byte_pos();
 
     // --- header ---
-    if br.read_raw_u32(14)? != 0x3ffe {
+    // As libFLAC's `read_frame_header_` (`stream_decoder.c:2735` ff.), the whole
+    // header is read up to its CRC-8 before most invalid fields are acted on
+    // (`is_unparseable`), so input that ends inside a header counts as truncated;
+    // a 0xFF byte, sample-rate code 15, an invalid number and block size 65536
+    // fail at once.
+    let mut unparseable = false;
+    let b0 = br.read_raw_u32(8)?;
+    let b1 = br.read_raw_u32(8)?;
+    if b0 != 0xFF || b1 >> 1 != 0x7C {
         return None; // sync
     }
-    let reserved = br.read_raw_u32(1)?;
-    let blocking_strategy = br.read_raw_u32(1)?; // 0 = fixed, 1 = variable block size
-    let bs_code = br.read_raw_u32(4)?;
-    let sr_code = br.read_raw_u32(4)?;
-    let ca_code = br.read_raw_u32(4)?;
-    let bps_code = br.read_raw_u32(3)?;
-    let reserved2 = br.read_raw_u32(1)?;
-    if reserved != 0 || reserved2 != 0 {
+    unparseable |= b1 & 0x02 != 0; // reserved
+    let blocking_strategy = b1 & 0x01; // 0 = fixed, 1 = variable block size
+    let b2 = br.read_raw_u32(8)?;
+    if b2 == 0xFF {
+        return None; // a sync code inside the header
+    }
+    let b3 = br.read_raw_u32(8)?;
+    if b3 == 0xFF {
+        return None;
+    }
+    let (bs_code, sr_code) = (b2 >> 4, b2 & 0x0F);
+    let (ca_code, bps_code) = (b3 >> 4, (b3 >> 1) & 0x07);
+    unparseable |= b3 & 0x01 != 0; // reserved
+    if sr_code == 15 {
         return None;
     }
     // Fixed block size carries the frame number (UTF-8 u32); variable carries the
@@ -623,6 +644,10 @@ pub(crate) fn decode_frame(br: &mut BitReader, stream: Option<&StreamHeader>) ->
     };
 
     let blocksize = match bs_code {
+        0 => {
+            unparseable = true; // reserved
+            0
+        }
         1 => 192,
         2 => 576,
         3 => 1152,
@@ -640,8 +665,7 @@ pub(crate) fn decode_frame(br: &mut BitReader, stream: Option<&StreamHeader>) ->
         12 => 4096,
         13 => 8192,
         14 => 16384,
-        15 => 32768,
-        _ => return None, // 0 reserved
+        _ => 32768,
     };
     let sample_rate = match sr_code {
         1 => 88200,
@@ -658,8 +682,7 @@ pub(crate) fn decode_frame(br: &mut BitReader, stream: Option<&StreamHeader>) ->
         12 => br.read_raw_u32(8)? * 1000,
         13 => br.read_raw_u32(16)?,
         14 => br.read_raw_u32(16)? * 10,
-        15 => return None, // invalid
-        _ => 0,            // from STREAMINFO (resolved by `Timeline::format`)
+        _ => 0, // from STREAMINFO (resolved by `Timeline::format`)
     };
     let bits_per_sample = match bps_code {
         1 => 8,
@@ -668,20 +691,33 @@ pub(crate) fn decode_frame(br: &mut BitReader, stream: Option<&StreamHeader>) ->
         5 => 20,
         6 => 24,
         7 => 32,
-        0 => stream?.bits_per_sample, // from STREAMINFO: any depth from 4 to 32
-        _ => return None,             // 3 is reserved
+        // From STREAMINFO: any depth from 4 to 32; unparseable without it.
+        0 => stream.map_or_else(
+            || {
+                unparseable = true;
+                0
+            },
+            |s| s.bits_per_sample,
+        ),
+        _ => {
+            unparseable = true; // 3 is reserved
+            0
+        }
     };
     let (assignment, channels) = match ca_code {
         0..=7 => (ChannelAssignment::Independent, ca_code + 1),
         8 => (ChannelAssignment::LeftSide, 2),
         9 => (ChannelAssignment::RightSide, 2),
         10 => (ChannelAssignment::MidSide, 2),
-        _ => return None,
+        _ => {
+            unparseable = true; // reserved
+            (ChannelAssignment::Independent, 0)
+        }
     };
 
     // CRC-8 over the header bytes just read (the reader is byte-aligned here).
     let computed_crc8 = crc8(br.bytes_since(frame_start));
-    if br.read_raw_u32(8)? as u8 != computed_crc8 {
+    if br.read_raw_u32(8)? as u8 != computed_crc8 || unparseable {
         return None;
     }
 
@@ -699,7 +735,11 @@ pub(crate) fn decode_frame(br: &mut BitReader, stream: Option<&StreamHeader>) ->
     }
 
     // --- footer: CRC-16 over the whole frame so far ---
-    br.align_to_byte();
+    // The padding to the next byte boundary must be zero (`read_zero_padding_`).
+    let pad = (8 - br.bit_pos() % 8) % 8;
+    if br.read_raw_u32(pad as u32)? != 0 {
+        return None;
+    }
     let computed_crc16 = crc16(br.bytes_since(frame_start));
     if br.read_raw_u32(16)? as u16 != computed_crc16 {
         return None;
@@ -1389,6 +1429,72 @@ mod tests {
                 "{label}"
             );
         }
+    }
+
+    /// More of libFLAC's frame checks: the padding before the CRC-16 must be
+    /// zero, and a header cut off by the end of the input is a truncation (ending
+    /// the stream), even if it holds a field libFLAC only rejects once the header
+    /// is complete.
+    #[test]
+    fn frame_checks_match_libflac() {
+        // A 12-bit CONSTANT subframe ends 4 bits before a byte boundary.
+        let constant = |pad: u32| {
+            let mut bw = BitWriter::new();
+            bw.write_raw_u32(0x3FFE, 14); // sync
+            bw.write_raw_u32(0, 2);
+            bw.write_raw_u32(6, 4); // 8-bit block size field
+            bw.write_raw_u32(9, 4); // 44.1 kHz
+            bw.write_raw_u32(0, 4); // mono
+            bw.write_raw_u32(2, 3); // 12 bits per sample
+            bw.write_raw_u32(0, 1);
+            bw.write_raw_u32(0, 8); // frame number 0
+            bw.write_raw_u32(16 - 1, 8);
+            let crc = bw.crc8();
+            bw.write_raw_u32(crc as u32, 8);
+            bw.write_raw_u32(0x00, 8); // CONSTANT
+            bw.write_raw_u32(5, 12);
+            bw.write_raw_u32(pad, 4); // the padding bits
+            let crc = bw.crc16();
+            bw.write_raw_u32(crc as u32, 16);
+            bw.as_bytes().to_vec()
+        };
+        assert_eq!(decode_frames(&constant(0)).unwrap().interleaved, [5; 16]);
+        assert!(decode_frames(&constant(0b0101)).is_none());
+
+        let valid = mono_frame(16, |bw| {
+            bw.write_raw_u32(0x00, 8);
+            bw.write_raw_u32(5, 8);
+        });
+        // A second header that is cut off, with reserved block-size code 0
+        // (rejected only after the CRC-8): a truncation.
+        let cut = [&valid[..], &[0xFF, 0xF8, 0x09, 0x08, 0x00]].concat();
+        let dec = decode_frames(&cut).unwrap();
+        assert!(dec.truncated);
+        assert_eq!(dec.interleaved, [5; 16]);
+        // Sample-rate code 15 is rejected at once.
+        let bad = [&valid[..], &[0xFF, 0xF8, 0x1F, 0x08]].concat();
+        assert!(decode_frames(&bad).is_none());
+    }
+
+    /// A Rice quotient beyond `u32::MAX >> parameter` is invalid
+    /// (`read_rice_signed_block`).
+    #[test]
+    fn rejects_oversized_rice_quotients() {
+        let mut bw = BitWriter::new();
+        bw.write_raw_u32(0, 8); // padding so the quotient starts unaligned
+        bw.write_raw_u32(0, 30); // 30 zero bits: quotient 30
+        bw.write_raw_u32(1, 1);
+        bw.write_raw_u32(0, 31); // 31 low bits
+        bw.zero_pad_to_byte_boundary();
+        let bytes = bw.as_bytes().to_vec();
+        let mut br = crate::bitreader::BitReader::new(&bytes);
+        br.read_raw_u32(8).unwrap();
+        // Parameter 27: limit u32::MAX >> 27 = 31, so a quotient of 30 is fine.
+        assert!(br.read_rice_signed(27).is_some());
+        let mut br = crate::bitreader::BitReader::new(&bytes);
+        br.read_raw_u32(8).unwrap();
+        // Parameter 28: limit 15, so 30 is invalid.
+        assert!(br.read_rice_signed(28).is_none());
     }
 
     /// Chained Ogg FLAC: `decode_ogg` takes the first link, `decode_ogg_chained`

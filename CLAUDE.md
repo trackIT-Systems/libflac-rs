@@ -269,13 +269,17 @@ residual/rice → CRC-16 — diffing at the first mismatching field.
   missing frames are filled with silence under libFLAC's rules (`Timeline::fill_gap`,
   `stream_decoder.c:2483`, reported as `Gap`s); out-of-range samples reject the
   frame (`OUT_OF_BOUNDS`, `:2455`); `decode_ogg` takes the first FLAC logical
-  stream and `decode_ogg_chained` every link (`ogg::read_flac_streams`). Checked
+  stream and `decode_ogg_chained` every link (`StreamDecoder::next_link`). Checked
   against libFLAC's decoder in `oracle/tests/decoder.rs`. Corrupt frames still fail
   the decode (libFLAC resynchronizes). Sample reconstruction mirrors libFLAC's
   integer widths (`Channel::Narrow` = its `int32` paths, wrapping; `Wide` = the
   33-bit side channel) so damaged-but-CRC-valid frames match it; truncated input
-  ends the stream (`truncated`), as in libFLAC. The `fuzz/` crate's `diff_decode`
-  target finds remaining differences.
+  ends the stream (`truncated`), as in libFLAC. Ogg is decoded the way libFLAC's
+  `ogg_decoder_aspect.c` does it: `stream::OggBytes` turns the pages of one FLAC
+  logical stream into the native byte stream (libogg's gap/continuation rules,
+  mapping headers stripped) for the native parser. The stream start is found with
+  libFLAC's `find_metadata_` scan (`find_start`). The `fuzz/` crate's `diff_decode`
+  target compares all of this with libFLAC's decoder.
 - **O1 — Ogg FLAC DONE (byte-exact).** `ogg.rs` ports libogg 1.3.5 paging
   (`framing.c`) + the FLAC-in-Ogg mapping (`ogg_encoder_aspect.c`).
   `encoder::encode_ogg` is **byte-identical to libFLAC+libogg** and
